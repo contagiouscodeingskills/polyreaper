@@ -97,14 +97,14 @@ pub struct PolymarketFeedConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketDiscoveryConfig {
-    // TODO verify endpoint + query shape for BTC 5-minute up/down markets.
+    /// Polymarket Gamma `/events` endpoint URL.
     pub gamma_url: String,
     /// How often we re-poll the discovery endpoint for new markets.
     pub poll_interval_secs: u64,
-    /// Regex applied to market titles to filter to BTC 5-minute up/down
-    /// markets. Kept as a pattern so filters can be refined without code
-    /// changes once we have live samples.
-    pub title_pattern: String,
+    /// Polymarket "series" slug to filter to. Each series is a recurring
+    /// template (e.g. `"btc-up-or-down-5m"`). Discovery keeps only events
+    /// whose `series[*].slug` matches this value.
+    pub series_slug: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,8 +207,8 @@ impl Config {
             "market_discovery.poll_interval_secs must be > 0",
         )?;
         require(
-            !self.market_discovery.title_pattern.trim().is_empty(),
-            "market_discovery.title_pattern must be non-empty",
+            !self.market_discovery.series_slug.trim().is_empty(),
+            "market_discovery.series_slug must be non-empty",
         )?;
 
         Ok(())
@@ -314,9 +314,9 @@ max_ms = 30000
 multiplier = 2.0
 
 [market_discovery]
-gamma_url = "https://gamma-api.polymarket.com/markets"
+gamma_url = "https://gamma-api.polymarket.com/events"
 poll_interval_secs = 15
-title_pattern = "(?i)bitcoin.*(up or down).*5.*(min|minute)"
+series_slug = "btc-up-or-down-5m"
 "#;
 
     #[test]

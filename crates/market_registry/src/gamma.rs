@@ -1,32 +1,31 @@
 //! Polymarket Gamma API adapter.
 //!
-//! Fetches live market metadata from `gamma-api.polymarket.com/markets`,
-//! filters to BTC 5-minute up/down markets via `title_pattern`, and maps
-//! the raw JSON into [`Market`] domain objects.
+//! Fetches live event metadata from `gamma-api.polymarket.com/events`,
+//! filters to a configured series (e.g. `"btc-up-or-down-5m"`), and maps
+//! each event's single market into a [`Market`] domain object.
+//!
+//! # Why events, not markets?
+//!
+//! Polymarket's recurring series (5-minute BTC up/down, hourly ETH ranges,
+//! weekly Amazon hit price, …) are exposed as **events**, with each
+//! event containing exactly one market. The standalone `/markets`
+//! endpoint omits these — they're only reachable via the `/events`
+//! endpoint, sorted by `startDate` descending and filtered by series.
+//!
+//! # Resolution source
+//!
+//! BTC up/down series resolves via the Chainlink BTC/USD price stream,
+//! **not** Binance Spot. The recorder still captures both venues — the
+//! research thesis "Binance microstructure → Polymarket pricing" treats
+//! that as a feature: cross-venue resolution mismatch is a knob to study,
+//! not a bug to fix.
 //!
 //! # Uncertainty policy
-//!
-//! Every assumed gamma field name is either on [`GammaMarket`] with a
-//! `#[serde(rename)]` or kept as `Option<_>` so missing fields don't blow
-//! up deserialisation of the whole response.
 //!
 //! Per-market mapping failures (missing required fields, malformed
 //! timestamps, unexpected outcome labels) **log and skip**; they do not
 //! fail the whole discovery pass. A malformed response *envelope* (not
-//! valid JSON or not an array) fails loudly with [`DiscoveryError::Parse`].
-//!
-//! The uncertain field mappings, in one place:
-//!
-//! | Domain field         | Gamma field             | Notes                                   |
-//! |----------------------|-------------------------|-----------------------------------------|
-//! | `MarketId`           | `conditionId` \| `id`   | hex for condition, stringified fallback |
-//! | `title`              | `question`              | human-readable, used by title filter    |
-//! | `slug`               | `slug`                  | URL slug                                |
-//! | yes/no `TokenId`     | `clobTokenIds`          | JSON-encoded string: `"[\"y\",\"n\"]"`  |
-//! | outcome labels       | `outcomes`              | JSON-encoded string: `"[\"Yes\",\"No\"]"` — same order as tokens |
-//! | `start_time_epoch`   | `startDate`             | ISO-8601 UTC, optional                  |
-//! | `end_time_epoch`     | `endDate`               | ISO-8601 UTC, required                  |
-//! | `resolved_outcome`   | `winningToken`          | token id match selects Yes/No           |
+//! valid JSON, not an array) fails loudly with [`DiscoveryError::Parse`].
 
 use std::time::Duration;
 
@@ -39,15 +38,13 @@ use crate::{DiscoveryError, Market, MarketDiscoverer, MarketId, Outcome, TokenId
 pub struct GammaAdapter {
     client: Client,
     base_url: String,
-    title_pattern: regex::Regex,
+    series_slug: String,
 }
 
 impl GammaAdapter {
-    /// Build an adapter from recorder config. Fails if the title regex
-    /// doesn't compile or the HTTP client can't be built.
+    /// Build an adapter from recorder config. Fails if the HTTP client
+    /// can't be constructed.
     pub fn new(cfg: &config::MarketDiscoveryConfig) -> Result<Self, DiscoveryError> {
-        let title_pattern = regex::Regex::new(&cfg.title_pattern)
-            .map_err(|e| DiscoveryError::Adapter(format!("title_pattern regex: {e}")))?;
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
             .user_agent(concat!("polybot-recorder/", env!("CARGO_PKG_VERSION")))
@@ -56,21 +53,23 @@ impl GammaAdapter {
         Ok(Self {
             client,
             base_url: cfg.gamma_url.clone(),
-            title_pattern,
+            series_slug: cfg.series_slug.clone(),
         })
     }
 
-    /// Issue the HTTP GET and return the raw body on 2xx, or an error.
+    /// Fetch the first page of currently-trading events sorted newest-first.
+    /// Single page is enough for series with under ~500 concurrently-open
+    /// markets (BTC 5m has ~200). Pagination is a future addition if a
+    /// series ever exceeds that.
     async fn fetch_raw_json(&self) -> Result<String, DiscoveryError> {
-        // Single page with limit=500. For BTC 5-min scope at most a handful
-        // of markets are active at any time; pagination can land later if
-        // we ever expand scope.
         let resp = self
             .client
             .get(&self.base_url)
             .query(&[
                 ("active", "true"),
                 ("closed", "false"),
+                ("order", "startDate"),
+                ("ascending", "false"),
                 ("limit", "500"),
             ])
             .send()
@@ -92,23 +91,47 @@ impl GammaAdapter {
             .map_err(|e| DiscoveryError::Parse(format!("gamma body: {e}")))
     }
 
-    /// Parse the envelope, filter by title regex, map to [`Market`]s,
-    /// emit a single summary log line. Pure function — exposed for unit
-    /// testing with fixture JSON (no network).
+    /// Parse the envelope, filter by series slug, map each kept event's
+    /// single market into a [`Market`]. Pure function — exposed for unit
+    /// testing without a network.
     pub fn map_response(&self, raw: &str) -> Result<Vec<Market>, DiscoveryError> {
-        let parsed: Vec<GammaMarket> = serde_json::from_str(raw).map_err(|e| {
+        let parsed: Vec<GammaEvent> = serde_json::from_str(raw).map_err(|e| {
             DiscoveryError::Parse(format!("gamma JSON envelope: {e}"))
         })?;
 
-        let (mut kept, mut title_rejected, mut map_errors) = (0usize, 0usize, 0usize);
+        let (mut kept, mut series_rejected, mut map_errors) = (0usize, 0usize, 0usize);
         let mut out = Vec::with_capacity(parsed.len());
 
-        for m in parsed {
-            if !self.title_pattern.is_match(&m.question) {
-                title_rejected += 1;
+        for ev in parsed {
+            // Series filter — skip events not in the configured series.
+            if !ev
+                .series
+                .iter()
+                .any(|s| s.slug.as_deref() == Some(self.series_slug.as_str()))
+            {
+                series_rejected += 1;
                 continue;
             }
-            match map_to_market(&m) {
+
+            // Each event in a recurring binary series should have exactly
+            // one market. Defensive on the count.
+            let raw_market = match ev.markets.first() {
+                Some(m) => m,
+                None => {
+                    map_errors += 1;
+                    tracing::warn!(
+                        component = "market_registry",
+                        venue = "polymarket",
+                        event = "market_map_failure",
+                        slug = %ev.slug.as_deref().unwrap_or("?"),
+                        reason = "event has no markets",
+                        "skipping malformed event"
+                    );
+                    continue;
+                }
+            };
+
+            match map_event_market(&ev, raw_market) {
                 Ok(market) => {
                     kept += 1;
                     out.push(market);
@@ -119,7 +142,7 @@ impl GammaAdapter {
                         component = "market_registry",
                         venue = "polymarket",
                         event = "market_map_failure",
-                        question = %m.question,
+                        slug = %ev.slug.as_deref().unwrap_or("?"),
                         reason = %reason,
                         "skipping malformed market"
                     );
@@ -131,8 +154,9 @@ impl GammaAdapter {
             component = "market_registry",
             venue = "polymarket",
             event = "discovery_pass",
+            series = %self.series_slug,
             kept = kept,
-            title_rejected = title_rejected,
+            series_rejected = series_rejected,
             map_errors = map_errors,
             "gamma discovery pass"
         );
@@ -152,22 +176,57 @@ impl MarketDiscoverer for GammaAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// Raw API shape — loose by design. Unknown fields are silently ignored so
-// gamma adding fields upstream doesn't break us.
+// Raw API shapes — loose by design. Unknown fields are silently ignored so
+// gamma can add fields upstream without breaking us.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+struct GammaEvent {
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    closed: Option<bool>,
+    #[serde(default)]
+    archived: Option<bool>,
+    #[serde(rename = "startDate", default)]
+    start_date: Option<String>,
+    #[serde(rename = "endDate", default)]
+    end_date: Option<String>,
+    /// Each event belongs to zero-or-more series (the recurring template).
+    /// We filter on this.
+    #[serde(default)]
+    series: Vec<GammaSeries>,
+    /// Each event contains its constituent markets. For the recurring
+    /// binary-outcome series we care about (BTC up/down 5m), this is a
+    /// single-element array.
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GammaSeries {
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    /// `"5m"`, `"1h"`, etc. when set. Not used for filtering today, but
+    /// useful for sanity-checking future config changes.
+    #[serde(default)]
+    recurrence: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GammaMarket {
-    /// Primary identifier. `conditionId` for v2 / on-chain markets;
-    /// `id` (numeric or string) as fallback.
     #[serde(rename = "conditionId", default)]
     condition_id: Option<String>,
-    #[serde(default)]
-    id: Option<serde_json::Value>,
 
-    /// Human-readable market question (used for title regex filtering).
-    question: String,
+    #[serde(default)]
+    question: Option<String>,
 
     #[serde(default)]
     slug: Option<String>,
@@ -177,37 +236,44 @@ struct GammaMarket {
     #[serde(rename = "clobTokenIds", default)]
     clob_token_ids: Option<String>,
 
-    /// JSON-encoded string: `"[\"Yes\", \"No\"]"`.
+    /// JSON-encoded string. For BTC up/down: `"[\"Up\", \"Down\"]"`.
+    /// For Yes/No markets: `"[\"Yes\", \"No\"]"`. Both are accepted.
     #[serde(default)]
     outcomes: Option<String>,
 
-    #[serde(rename = "startDate", default)]
-    start_date: Option<String>,
+    /// JSON-encoded string. After resolution, one entry is `"1"` and the
+    /// other `"0"`. Before resolution, both reflect current trading prices
+    /// (e.g. `"0.62"` / `"0.38"`).
+    #[serde(rename = "outcomePrices", default)]
+    outcome_prices: Option<String>,
+
     #[serde(rename = "endDate", default)]
     end_date: Option<String>,
-
-    #[serde(default)]
-    active: Option<bool>,
-    #[serde(default)]
-    closed: Option<bool>,
-
-    /// Token id that won at resolution, if the market has resolved.
-    #[serde(rename = "winningToken", default)]
-    winning_token: Option<String>,
+    #[serde(rename = "startDate", default)]
+    start_date: Option<String>,
 }
 
-fn map_to_market(m: &GammaMarket) -> Result<Market, String> {
-    // Primary id: prefer conditionId, fall back to `id` as stringified value.
+/// Build a [`Market`] from an event + its single market record.
+///
+/// Field precedence: market fields win when present; the event provides
+/// fallbacks for things like dates and slug.
+fn map_event_market(event: &GammaEvent, m: &GammaMarket) -> Result<Market, String> {
     let id = m
         .condition_id
         .clone()
-        .or_else(|| {
-            m.id.as_ref().map(|v| match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-        })
-        .ok_or_else(|| "missing conditionId / id".to_string())?;
+        .ok_or_else(|| "missing market.conditionId".to_string())?;
+
+    let title = m
+        .question
+        .clone()
+        .or_else(|| event.title.clone())
+        .ok_or_else(|| "missing question and event title".to_string())?;
+
+    let slug = m
+        .slug
+        .clone()
+        .or_else(|| event.slug.clone())
+        .unwrap_or_default();
 
     // Tokens.
     let tokens_raw = m
@@ -220,7 +286,8 @@ fn map_to_market(m: &GammaMarket) -> Result<Market, String> {
         return Err(format!("expected 2 clobTokenIds, got {}", tokens.len()));
     }
 
-    // Outcomes (Yes/No labels).
+    // Outcomes — accept both `[Yes, No]` and `[Up, Down]` (Polymarket's
+    // BTC up/down series uses the latter).
     let outcomes_raw = m
         .outcomes
         .as_ref()
@@ -232,29 +299,40 @@ fn map_to_market(m: &GammaMarket) -> Result<Market, String> {
     }
 
     let (yes_idx, no_idx) = match (outcomes[0].as_str(), outcomes[1].as_str()) {
-        ("Yes", "No") => (0usize, 1usize),
-        ("No", "Yes") => (1usize, 0usize),
+        ("Yes", "No") | ("Up", "Down") => (0usize, 1usize),
+        ("No", "Yes") | ("Down", "Up") => (1usize, 0usize),
         (a, b) => return Err(format!("unexpected outcome labels: [{a:?}, {b:?}]")),
     };
     let yes_token = TokenId::new(&tokens[yes_idx]);
     let no_token = TokenId::new(&tokens[no_idx]);
 
-    // End time is required.
+    // End time is required; pull from market then fall back to event.
     let end_str = m
         .end_date
         .as_ref()
+        .or(event.end_date.as_ref())
         .ok_or_else(|| "missing endDate".to_string())?;
     let end_time_epoch = parse_iso8601_to_epoch(end_str)
         .ok_or_else(|| format!("invalid endDate: {end_str:?}"))?;
 
     // Start time is optional.
-    let start_time_epoch = m.start_date.as_ref().and_then(|s| parse_iso8601_to_epoch(s));
+    let start_time_epoch = m
+        .start_date
+        .as_ref()
+        .or(event.start_date.as_ref())
+        .and_then(|s| parse_iso8601_to_epoch(s));
 
-    // Resolution: if `winningToken` matches yes/no token id, that side won.
-    let resolved_outcome = m.winning_token.as_ref().and_then(|tok| {
-        if tok == &tokens[yes_idx] {
+    // Resolution — derived from `outcomePrices`. After settlement one is
+    // exactly "1", the other "0". Active markets show fractional prices,
+    // which won't match — `resolved_outcome` stays `None` until resolved.
+    let resolved_outcome = m.outcome_prices.as_ref().and_then(|raw| {
+        let prices: Vec<String> = serde_json::from_str(raw).ok()?;
+        if prices.len() != 2 {
+            return None;
+        }
+        if prices[yes_idx].trim() == "1" {
             Some(Outcome::Yes)
-        } else if tok == &tokens[no_idx] {
+        } else if prices[no_idx].trim() == "1" {
             Some(Outcome::No)
         } else {
             None
@@ -263,8 +341,8 @@ fn map_to_market(m: &GammaMarket) -> Result<Market, String> {
 
     Ok(Market {
         id: MarketId::new(id),
-        title: m.question.clone(),
-        slug: m.slug.clone().unwrap_or_default(),
+        title,
+        slug,
         yes_token,
         no_token,
         start_time_epoch,
@@ -274,8 +352,8 @@ fn map_to_market(m: &GammaMarket) -> Result<Market, String> {
 }
 
 // ---------------------------------------------------------------------------
-// ISO 8601 UTC -> epoch seconds. Hand-rolled so we don't pull chrono/time
-// for one function. Accepts gamma's emitted forms:
+// ISO 8601 UTC -> epoch seconds. Hand-rolled; accepts the formats gamma
+// emits in practice:
 //   YYYY-MM-DDTHH:MM:SSZ
 //   YYYY-MM-DDTHH:MM:SS.fffZ
 //   YYYY-MM-DDTHH:MM:SS±00:00  (UTC offsets only)
@@ -291,7 +369,6 @@ fn parse_iso8601_to_epoch(s: &str) -> Option<i64> {
     } else {
         return None;
     };
-    // Strip fractional seconds.
     let body = body.split_once('.').map(|(a, _)| a).unwrap_or(body);
 
     let (date, time) = body.split_once('T')?;
@@ -315,7 +392,6 @@ fn parse_iso8601_to_epoch(s: &str) -> Option<i64> {
     civil_to_epoch(y, mo, da, h, mi, sc)
 }
 
-/// Howard Hinnant's days_from_civil (forward direction).
 fn civil_to_epoch(y: i64, m: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i64> {
     if !(1..=12).contains(&m) {
         return None;
@@ -355,9 +431,9 @@ mod tests {
 
     fn cfg() -> config::MarketDiscoveryConfig {
         config::MarketDiscoveryConfig {
-            gamma_url: "https://gamma-api.polymarket.com/markets".to_string(),
+            gamma_url: "https://gamma-api.polymarket.com/events".to_string(),
             poll_interval_secs: 15,
-            title_pattern: r"(?i)bitcoin.*(up or down).*5.*(min|minute)".to_string(),
+            series_slug: "btc-up-or-down-5m".to_string(),
         }
     }
 
@@ -376,10 +452,6 @@ mod tests {
             parse_iso8601_to_epoch("2024-01-01T00:00:00+00:00"),
             Some(1_704_067_200)
         );
-        assert_eq!(
-            parse_iso8601_to_epoch("2024-01-01T00:00:00-00:00"),
-            Some(1_704_067_200)
-        );
     }
 
     #[test]
@@ -387,58 +459,103 @@ mod tests {
         assert_eq!(parse_iso8601_to_epoch("2024-01-01T00:00:00+05:00"), None);
         assert_eq!(parse_iso8601_to_epoch("2024/01/01 00:00:00"), None);
         assert_eq!(parse_iso8601_to_epoch("not a timestamp"), None);
-        // Month 13.
         assert_eq!(parse_iso8601_to_epoch("2024-13-01T00:00:00Z"), None);
     }
 
-    const FIXTURE_HAPPY: &str = r#"[
+    /// One event in the configured series, currently trading. This shape
+    /// matches the live response from
+    /// `gamma-api.polymarket.com/events?slug=btc-updown-5m-1776415200`.
+    const FIXTURE_BTC_UPDOWN: &str = r#"[
   {
-    "conditionId": "0xabc123",
-    "question": "Bitcoin Up or Down - 5 minutes",
-    "slug": "btc-up-or-down-5min-2026-04-23-00-00",
-    "clobTokenIds": "[\"111\", \"222\"]",
-    "outcomes": "[\"Yes\", \"No\"]",
-    "startDate": "2026-04-23T00:00:00.000Z",
-    "endDate": "2026-04-23T00:05:00.000Z",
+    "id": "384681",
+    "slug": "btc-updown-5m-1776415200",
+    "title": "Bitcoin Up or Down - April 17, 4:40AM-4:45AM ET",
+    "startDate": "2026-04-16T08:48:00.000Z",
+    "endDate": "2026-04-17T08:45:00Z",
     "active": true,
-    "closed": false
+    "closed": false,
+    "series": [
+      {
+        "slug": "btc-up-or-down-5m",
+        "title": "BTC Up or Down 5m",
+        "recurrence": "5m"
+      }
+    ],
+    "markets": [
+      {
+        "conditionId": "0xb56bbed2f9f79f81d0511b3570d9d21072465b00c7e9b021ae44bb73cf1c06c9",
+        "question": "Bitcoin Up or Down - April 17, 4:40AM-4:45AM ET",
+        "slug": "btc-updown-5m-1776415200",
+        "clobTokenIds": "[\"111\", \"222\"]",
+        "outcomes": "[\"Up\", \"Down\"]",
+        "outcomePrices": "[\"0.62\", \"0.38\"]",
+        "startDate": "2026-04-16T08:48:16.000Z",
+        "endDate": "2026-04-17T08:45:00Z"
+      }
+    ]
   }
 ]"#;
 
     #[test]
-    fn maps_happy_fixture() {
+    fn maps_btc_updown_event_to_market() {
         let adapter = GammaAdapter::new(&cfg()).unwrap();
-        let out = adapter.map_response(FIXTURE_HAPPY).unwrap();
+        let out = adapter.map_response(FIXTURE_BTC_UPDOWN).unwrap();
         assert_eq!(out.len(), 1);
         let m = &out[0];
-        assert_eq!(m.id.as_str(), "0xabc123");
-        assert_eq!(m.title, "Bitcoin Up or Down - 5 minutes");
-        assert_eq!(m.slug, "btc-up-or-down-5min-2026-04-23-00-00");
+        assert_eq!(
+            m.id.as_str(),
+            "0xb56bbed2f9f79f81d0511b3570d9d21072465b00c7e9b021ae44bb73cf1c06c9"
+        );
+        assert!(m.title.starts_with("Bitcoin Up or Down"));
+        assert_eq!(m.slug, "btc-updown-5m-1776415200");
+        // "Up" comes first in `outcomes`, so token "111" is the Up/Yes side.
         assert_eq!(m.yes_token.as_str(), "111");
         assert_eq!(m.no_token.as_str(), "222");
-        assert_eq!(m.end_time_epoch - m.start_time_epoch.unwrap(), 5 * 60);
-        assert!(m.resolved_outcome.is_none());
+        assert!(m.start_time_epoch.is_some());
+        assert!(m.resolved_outcome.is_none(), "fractional prices = unresolved");
     }
 
     #[test]
-    fn reversed_outcome_labels_swap_tokens() {
-        let raw = FIXTURE_HAPPY.replace(
-            r#""outcomes": "[\"Yes\", \"No\"]""#,
-            r#""outcomes": "[\"No\", \"Yes\"]""#,
+    fn reversed_outcome_order_swaps_tokens() {
+        let raw = FIXTURE_BTC_UPDOWN.replace(
+            r#""outcomes": "[\"Up\", \"Down\"]""#,
+            r#""outcomes": "[\"Down\", \"Up\"]""#,
         );
         let adapter = GammaAdapter::new(&cfg()).unwrap();
         let out = adapter.map_response(&raw).unwrap();
         let m = &out[0];
-        // Tokens are still in original order; outcomes tell us which is which.
+        // Now token "222" is the Up/Yes side because Up is at index 1.
         assert_eq!(m.yes_token.as_str(), "222");
         assert_eq!(m.no_token.as_str(), "111");
     }
 
     #[test]
-    fn unrelated_question_is_title_filtered() {
-        let raw = FIXTURE_HAPPY.replace(
-            "Bitcoin Up or Down - 5 minutes",
-            "Will ETH hit 5000 by year end?",
+    fn yes_no_outcomes_still_work() {
+        // Other Polymarket markets use Yes/No labels — ensure backward-compat.
+        let raw = FIXTURE_BTC_UPDOWN.replace(
+            r#""outcomes": "[\"Up\", \"Down\"]""#,
+            r#""outcomes": "[\"Yes\", \"No\"]""#,
+        );
+        let adapter = GammaAdapter::new(&cfg()).unwrap();
+        let out = adapter.map_response(&raw).unwrap();
+        assert_eq!(out[0].yes_token.as_str(), "111");
+        assert_eq!(out[0].no_token.as_str(), "222");
+    }
+
+    #[test]
+    fn wrong_series_filtered_out() {
+        let raw = FIXTURE_BTC_UPDOWN
+            .replace("\"slug\": \"btc-up-or-down-5m\"", "\"slug\": \"some-other-series\"");
+        let adapter = GammaAdapter::new(&cfg()).unwrap();
+        let out = adapter.map_response(&raw).unwrap();
+        assert!(out.is_empty(), "events outside the series should be skipped");
+    }
+
+    #[test]
+    fn event_with_no_markets_skipped() {
+        let raw = FIXTURE_BTC_UPDOWN.replace(
+            "\"markets\": [",
+            "\"markets\": [],\"_dropped\": [",
         );
         let adapter = GammaAdapter::new(&cfg()).unwrap();
         let out = adapter.map_response(&raw).unwrap();
@@ -446,12 +563,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_field_skips_market() {
-        // Remove conditionId; fixture has no `id` either, so mapping fails.
-        let bad = FIXTURE_HAPPY.replace(r#""conditionId": "0xabc123","#, "");
+    fn missing_condition_id_skips_market() {
+        let bad = FIXTURE_BTC_UPDOWN.replace(
+            r#""conditionId": "0xb56bbed2f9f79f81d0511b3570d9d21072465b00c7e9b021ae44bb73cf1c06c9","#,
+            "",
+        );
         let adapter = GammaAdapter::new(&cfg()).unwrap();
         let out = adapter.map_response(&bad).unwrap();
-        assert!(out.is_empty(), "mapping should have skipped the market");
+        assert!(out.is_empty(), "should skip when conditionId missing");
     }
 
     #[test]
@@ -465,17 +584,18 @@ mod tests {
 
     #[test]
     fn malformed_end_date_skips_market() {
-        let raw = FIXTURE_HAPPY.replace("2026-04-23T00:05:00.000Z", "garbage");
+        let raw = FIXTURE_BTC_UPDOWN.replace("2026-04-17T08:45:00Z", "garbage");
         let adapter = GammaAdapter::new(&cfg()).unwrap();
         let out = adapter.map_response(&raw).unwrap();
         assert!(out.is_empty());
     }
 
     #[test]
-    fn winning_token_marks_resolved_yes() {
-        let raw = FIXTURE_HAPPY.replace(
-            r#""closed": false"#,
-            r#""closed": true, "winningToken": "111""#,
+    fn outcome_prices_one_zero_marks_resolved_yes() {
+        // Settled with "Up" winning.
+        let raw = FIXTURE_BTC_UPDOWN.replace(
+            r#""outcomePrices": "[\"0.62\", \"0.38\"]""#,
+            r#""outcomePrices": "[\"1\", \"0\"]""#,
         );
         let adapter = GammaAdapter::new(&cfg()).unwrap();
         let out = adapter.map_response(&raw).unwrap();
@@ -483,10 +603,11 @@ mod tests {
     }
 
     #[test]
-    fn winning_token_marks_resolved_no() {
-        let raw = FIXTURE_HAPPY.replace(
-            r#""closed": false"#,
-            r#""closed": true, "winningToken": "222""#,
+    fn outcome_prices_zero_one_marks_resolved_no() {
+        // Settled with "Down" winning.
+        let raw = FIXTURE_BTC_UPDOWN.replace(
+            r#""outcomePrices": "[\"0.62\", \"0.38\"]""#,
+            r#""outcomePrices": "[\"0\", \"1\"]""#,
         );
         let adapter = GammaAdapter::new(&cfg()).unwrap();
         let out = adapter.map_response(&raw).unwrap();

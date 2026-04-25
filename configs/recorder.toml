@@ -38,8 +38,10 @@ max_ms = 30000
 multiplier = 2.0
 
 [market_discovery]
-# TODO verify endpoint + query shape for filtering BTC 5-minute up/down
-# markets. Title regex is a placeholder refined once we see real samples.
-gamma_url = "https://gamma-api.polymarket.com/markets"
+# Polymarket Gamma `/events` endpoint. Discovery filters to events whose
+# `series.slug` equals `series_slug` below. The series is the recurring
+# template — events under it are the individual 5-minute windows. Each
+# resolves via Chainlink BTC/USD, not Binance Spot.
+gamma_url = "https://gamma-api.polymarket.com/events"
 poll_interval_secs = 15
-title_pattern = "(?i)bitcoin.*(up or down).*5.*(min|minute)"
+series_slug = "btc-up-or-down-5m"
