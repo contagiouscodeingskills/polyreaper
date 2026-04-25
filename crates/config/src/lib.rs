@@ -26,6 +26,8 @@ pub struct Config {
     pub binance_feed: BinanceFeedConfig,
     pub polymarket_feed: PolymarketFeedConfig,
     pub market_discovery: MarketDiscoveryConfig,
+    pub coinbase_feed: CoinbaseFeedConfig,
+    pub chainlink_feed: ChainlinkFeedConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +107,34 @@ pub struct MarketDiscoveryConfig {
     /// template (e.g. `"btc-up-or-down-5m"`). Discovery keeps only events
     /// whose `series[*].slug` matches this value.
     pub series_slug: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoinbaseFeedConfig {
+    /// Coinbase Advanced Trade WebSocket endpoint.
+    pub ws_url: String,
+    /// Product ids to subscribe to (e.g. `["BTC-USD"]`).
+    pub product_ids: Vec<String>,
+    /// Channel name. Phase 1: `"market_trades"` for trade-by-trade.
+    pub channel: String,
+    pub read_idle_secs: u64,
+    pub reconnect: ReconnectBackoff,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainlinkFeedConfig {
+    /// Ethereum JSON-RPC WebSocket endpoint (e.g. publicnode).
+    pub ws_url: String,
+    /// On-chain Chainlink AggregatorV3 contract address (BTC/USD on
+    /// Ethereum Mainnet: `0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c`).
+    /// We subscribe to **all** events from this address — no topic
+    /// filter — so we capture `AnswerUpdated` plus anything else the
+    /// contract emits, useful for cross-checking resolution events.
+    pub contract_address: String,
+    pub read_idle_secs: u64,
+    pub reconnect: ReconnectBackoff,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -210,6 +240,33 @@ impl Config {
             !self.market_discovery.series_slug.trim().is_empty(),
             "market_discovery.series_slug must be non-empty",
         )?;
+
+        check_ws_url(&self.coinbase_feed.ws_url, "coinbase_feed.ws_url")?;
+        require(
+            !self.coinbase_feed.product_ids.is_empty(),
+            "coinbase_feed.product_ids must list at least one product",
+        )?;
+        require(
+            !self.coinbase_feed.channel.trim().is_empty(),
+            "coinbase_feed.channel must be non-empty",
+        )?;
+        require(
+            self.coinbase_feed.read_idle_secs > 0,
+            "coinbase_feed.read_idle_secs must be > 0",
+        )?;
+        check_backoff(&self.coinbase_feed.reconnect, "coinbase_feed.reconnect")?;
+
+        check_ws_url(&self.chainlink_feed.ws_url, "chainlink_feed.ws_url")?;
+        require(
+            self.chainlink_feed.contract_address.starts_with("0x")
+                && self.chainlink_feed.contract_address.len() == 42,
+            "chainlink_feed.contract_address must be a 0x-prefixed 42-char hex string",
+        )?;
+        require(
+            self.chainlink_feed.read_idle_secs > 0,
+            "chainlink_feed.read_idle_secs must be > 0",
+        )?;
+        check_backoff(&self.chainlink_feed.reconnect, "chainlink_feed.reconnect")?;
 
         Ok(())
     }
@@ -317,6 +374,25 @@ multiplier = 2.0
 gamma_url = "https://gamma-api.polymarket.com/events"
 poll_interval_secs = 15
 series_slug = "btc-up-or-down-5m"
+
+[coinbase_feed]
+ws_url = "wss://advanced-trade-ws.coinbase.com"
+product_ids = ["BTC-USD"]
+channel = "market_trades"
+read_idle_secs = 30
+[coinbase_feed.reconnect]
+initial_ms = 500
+max_ms = 30000
+multiplier = 2.0
+
+[chainlink_feed]
+ws_url = "wss://ethereum-rpc.publicnode.com"
+contract_address = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
+read_idle_secs = 60
+[chainlink_feed.reconnect]
+initial_ms = 1000
+max_ms = 60000
+multiplier = 2.0
 "#;
 
     #[test]

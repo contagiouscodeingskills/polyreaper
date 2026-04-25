@@ -5,6 +5,9 @@
 //! (Ctrl-C), then aborts the feed task and flushes storage with a bounded
 //! grace window.
 
+mod latency;
+mod sweep;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -150,6 +153,50 @@ async fn main() -> ExitCode {
         "gamma discovery loop spawned"
     );
 
+    // Resolution sweeper — captures Up/Down outcomes for closed markets
+    // by polling /events?closed=true. Independent from active discovery
+    // because the cadence + filters differ (~60s sweep, closed-only).
+    let resolution_adapter = match market_registry::GammaAdapter::new(&cfg.market_discovery) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                component = "recorder",
+                event = "resolution_init_failed",
+                error = %e,
+                "aborting"
+            );
+            return ExitCode::from(6);
+        }
+    };
+    let resolution_store = Arc::clone(&store);
+    let resolution_handle = tokio::spawn(async move {
+        sweep::run_resolution_sweep_loop(
+            resolution_adapter,
+            resolution_store,
+            Duration::from_secs(60),
+        )
+        .await
+    });
+    tracing::info!(
+        component = "recorder",
+        event = "resolution_sweep_spawned",
+        interval_secs = 60,
+        "resolution sweep spawned"
+    );
+
+    // Latency probe — periodic TCP connect time to each venue endpoint.
+    // Logs to journald only; useful for cross-venue clock alignment and
+    // detecting routing changes.
+    let latency_handle = tokio::spawn(async {
+        latency::run_latency_probe_loop(Duration::from_secs(300)).await
+    });
+    tracing::info!(
+        component = "recorder",
+        event = "latency_probe_spawned",
+        interval_secs = 300,
+        "latency probe spawned"
+    );
+
     // 5. Feeds — Binance + Polymarket, both as independent tokio tasks.
     let binance_cfg = cfg.binance_feed.clone();
     let binance_store = Arc::clone(&store);
@@ -184,6 +231,32 @@ async fn main() -> ExitCode {
         "polymarket feed task spawned"
     );
 
+    let coinbase_cfg = cfg.coinbase_feed.clone();
+    let coinbase_store = Arc::clone(&store);
+    let coinbase_stats = coinbase_feed::FeedStats::new();
+    let coinbase_handle = tokio::spawn(async move {
+        coinbase_feed::run(&coinbase_cfg, coinbase_store, coinbase_stats).await
+    });
+    tracing::info!(
+        component = "recorder",
+        event = "feed_spawned",
+        venue = "coinbase",
+        "coinbase feed task spawned"
+    );
+
+    let chainlink_cfg = cfg.chainlink_feed.clone();
+    let chainlink_store = Arc::clone(&store);
+    let chainlink_stats = chainlink_feed::FeedStats::new();
+    let chainlink_handle = tokio::spawn(async move {
+        chainlink_feed::run(&chainlink_cfg, chainlink_store, chainlink_stats).await
+    });
+    tracing::info!(
+        component = "recorder",
+        event = "feed_spawned",
+        venue = "chainlink",
+        "chainlink feed task spawned"
+    );
+
     // 6. Wait for a shutdown signal (SIGTERM/SIGINT on unix, Ctrl-C on win).
     match wait_for_shutdown().await {
         Ok(sig) => tracing::info!(
@@ -204,10 +277,18 @@ async fn main() -> ExitCode {
     //    (see docs/TECH_DEBT.md §4).
     binance_handle.abort();
     polymarket_handle.abort();
+    coinbase_handle.abort();
+    chainlink_handle.abort();
     discovery_handle.abort();
+    resolution_handle.abort();
+    latency_handle.abort();
     let _ = binance_handle.await;
     let _ = polymarket_handle.await;
+    let _ = coinbase_handle.await;
+    let _ = chainlink_handle.await;
     let _ = discovery_handle.await;
+    let _ = resolution_handle.await;
+    let _ = latency_handle.await;
 
     // 8. Best-effort flush with a bounded grace window.
     let grace = Duration::from_secs(cfg.app.shutdown_grace_secs.max(1));

@@ -24,6 +24,8 @@ pub const NAME: &str = "common";
 pub enum Venue {
     Binance,
     Polymarket,
+    Coinbase,
+    Chainlink,
 }
 
 impl Venue {
@@ -31,6 +33,8 @@ impl Venue {
         match self {
             Venue::Binance => "binance",
             Venue::Polymarket => "polymarket",
+            Venue::Coinbase => "coinbase",
+            Venue::Chainlink => "chainlink",
         }
     }
 }

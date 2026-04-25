@@ -14,6 +14,8 @@ storage         = { workspace = true }
 market_registry = { workspace = true }
 binance_feed    = { workspace = true }
 polymarket_feed = { workspace = true }
+coinbase_feed   = { workspace = true }
+chainlink_feed  = { workspace = true }
 
 tracing         = { workspace = true }
 tokio           = { workspace = true }

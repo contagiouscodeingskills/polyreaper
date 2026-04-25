@@ -30,7 +30,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{DiscoveryError, Market, MarketDiscoverer, MarketId, Outcome, TokenId};
 
@@ -175,12 +175,96 @@ impl MarketDiscoverer for GammaAdapter {
     }
 }
 
+/// One resolved market plus the raw Gamma event JSON it came from. The
+/// `market.resolved_outcome` is guaranteed `Some(_)` — that's the filter.
+#[derive(Debug, Clone)]
+pub struct ResolvedMarket {
+    pub market: Market,
+    /// Re-serialised JSON of the original Gamma event. Field order /
+    /// whitespace are canonical, but keys and values are preserved.
+    pub raw_event_json: String,
+}
+
+impl GammaAdapter {
+    /// Fetch the most-recent closed events in the configured series and
+    /// return only the ones that have actually resolved (one
+    /// `outcomePrices` entry == `"1"`).
+    ///
+    /// Sorted newest-first by `endDate`. Used by the recorder's
+    /// resolution-sweep loop to capture Up/Down ground-truth labels for
+    /// markets whose trading window has ended.
+    pub async fn fetch_resolved_events(&self) -> Result<Vec<ResolvedMarket>, DiscoveryError> {
+        let resp = self
+            .client
+            .get(&self.base_url)
+            .query(&[
+                ("closed", "true"),
+                ("archived", "false"),
+                ("order", "endDate"),
+                ("ascending", "false"),
+                ("limit", "500"),
+            ])
+            .send()
+            .await
+            .map_err(|e| DiscoveryError::Transport(format!("gamma resolved GET: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(DiscoveryError::Transport(format!(
+                "gamma resolved HTTP {}: {}",
+                status,
+                truncate(&body, 256)
+            )));
+        }
+
+        let raw = resp
+            .text()
+            .await
+            .map_err(|e| DiscoveryError::Parse(format!("gamma resolved body: {e}")))?;
+
+        let parsed: Vec<GammaEvent> = serde_json::from_str(&raw).map_err(|e| {
+            DiscoveryError::Parse(format!("gamma resolved JSON envelope: {e}"))
+        })?;
+
+        let mut out = Vec::new();
+        for ev in parsed {
+            // Series filter.
+            if !ev
+                .series
+                .iter()
+                .any(|s| s.slug.as_deref() == Some(self.series_slug.as_str()))
+            {
+                continue;
+            }
+            let raw_market = match ev.markets.first() {
+                Some(m) => m,
+                None => continue,
+            };
+            let market = match map_event_market(&ev, raw_market) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            // Only keep events that actually resolved.
+            if market.resolved_outcome.is_none() {
+                continue;
+            }
+            let raw_event_json = serde_json::to_string(&ev).unwrap_or_default();
+            out.push(ResolvedMarket {
+                market,
+                raw_event_json,
+            });
+        }
+        Ok(out)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw API shapes — loose by design. Unknown fields are silently ignored so
 // gamma can add fields upstream without breaking us.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct GammaEvent {
     #[serde(default)]
@@ -206,7 +290,7 @@ struct GammaEvent {
     markets: Vec<GammaMarket>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct GammaSeries {
     #[serde(default)]
@@ -219,7 +303,7 @@ struct GammaSeries {
     recurrence: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct GammaMarket {
     #[serde(rename = "conditionId", default)]

@@ -45,3 +45,27 @@ multiplier = 2.0
 gamma_url = "https://gamma-api.polymarket.com/events"
 poll_interval_secs = 15
 series_slug = "btc-up-or-down-5m"
+
+[coinbase_feed]
+# Coinbase Advanced Trade WebSocket. Public, no auth needed for
+# `market_trades`.
+ws_url = "wss://advanced-trade-ws.coinbase.com"
+product_ids = ["BTC-USD"]
+channel = "market_trades"
+read_idle_secs = 30
+[coinbase_feed.reconnect]
+initial_ms = 500
+max_ms = 30000
+multiplier = 2.0
+
+[chainlink_feed]
+# Ethereum mainnet WebSocket RPC. publicnode is free, rate-limited.
+# Swap to Alchemy/Infura for higher reliability.
+ws_url = "wss://ethereum-rpc.publicnode.com"
+# Chainlink BTC/USD AggregatorV3 on Ethereum Mainnet.
+contract_address = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
+read_idle_secs = 60
+[chainlink_feed.reconnect]
+initial_ms = 1000
+max_ms = 60000
+multiplier = 2.0
