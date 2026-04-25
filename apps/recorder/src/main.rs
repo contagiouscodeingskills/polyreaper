@@ -150,7 +150,7 @@ async fn main() -> ExitCode {
         "gamma discovery loop spawned"
     );
 
-    // 5. Feeds. Binance goes first; polymarket comes in a later task.
+    // 5. Feeds — Binance + Polymarket, both as independent tokio tasks.
     let binance_cfg = cfg.binance_feed.clone();
     let binance_store = Arc::clone(&store);
     let binance_stats = binance_feed::FeedStats::new();
@@ -162,6 +162,26 @@ async fn main() -> ExitCode {
         event = "feed_spawned",
         venue = "binance",
         "binance feed task spawned"
+    );
+
+    let polymarket_cfg = cfg.polymarket_feed.clone();
+    let polymarket_store = Arc::clone(&store);
+    let polymarket_registry = Arc::clone(&registry);
+    let polymarket_stats = polymarket_feed::FeedStats::new();
+    let polymarket_handle = tokio::spawn(async move {
+        polymarket_feed::run(
+            &polymarket_cfg,
+            polymarket_registry,
+            polymarket_store,
+            polymarket_stats,
+        )
+        .await
+    });
+    tracing::info!(
+        component = "recorder",
+        event = "feed_spawned",
+        venue = "polymarket",
+        "polymarket feed task spawned"
     );
 
     // 6. Wait for a shutdown signal (SIGTERM/SIGINT on unix, Ctrl-C on win).
@@ -183,8 +203,10 @@ async fn main() -> ExitCode {
     // 7. Abort background tasks. Phase 1: abrupt abort, not graceful cancel
     //    (see docs/TECH_DEBT.md §4).
     binance_handle.abort();
+    polymarket_handle.abort();
     discovery_handle.abort();
     let _ = binance_handle.await;
+    let _ = polymarket_handle.await;
     let _ = discovery_handle.await;
 
     // 8. Best-effort flush with a bounded grace window.
@@ -219,10 +241,5 @@ async fn main() -> ExitCode {
     }
 
     tracing::info!(component = "recorder", event = "shutdown", "bye");
-
-    // polymarket_feed is still a placeholder — touch NAME so cargo doesn't
-    // flag its dep as unused.
-    let _wired = polymarket_feed::NAME;
-
     ExitCode::SUCCESS
 }

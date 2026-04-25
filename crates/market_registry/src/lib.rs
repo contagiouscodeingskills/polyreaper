@@ -197,6 +197,15 @@ impl Registry {
         self.by_id.values()
     }
 
+    /// Find the market that owns the given token id (Yes-side or No-side).
+    /// O(N) scan — fine for the BTC 5-min series (~200 active markets at
+    /// peak); revisit if we ever scale to thousands.
+    pub fn market_by_token(&self, token: &TokenId) -> Option<&Market> {
+        self.by_id
+            .values()
+            .find(|m| &m.yes_token == token || &m.no_token == token)
+    }
+
     /// Upsert a batch. Returns a count of genuinely new markets vs. updates
     /// to already-known ids. Does **not** remove markets absent from the
     /// batch — use [`prune`](Self::prune) for that.

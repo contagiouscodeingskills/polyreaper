@@ -36,6 +36,7 @@ dependencies = [
  "common",
  "config",
  "futures-util",
+ "reqwest",
  "serde_json",
  "storage",
  "telemetry",
@@ -752,6 +753,19 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "polymarket_feed"
 version = "0.1.0"
+dependencies = [
+ "common",
+ "config",
+ "futures-util",
+ "market_registry",
+ "serde_json",
+ "storage",
+ "telemetry",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
 
 [[package]]
 name = "potential_utf"

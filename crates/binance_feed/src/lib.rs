@@ -17,6 +17,7 @@
 
 mod conn;
 mod frame;
+mod snapshot;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
