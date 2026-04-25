@@ -63,3 +63,21 @@ Why deferred:
 Trigger to revisit:
 - When multiple feeds are running and ordered shutdown matters.
 - Or if `process_text` ever grows `.await` points (e.g. async storage), making abort unsafe.
+
+
+## 5. Gamma API deprecation header
+Current:
+- Gamma `/events` and `/markets` responses include a `deprecation: true` HTTP header.
+- Endpoints are alive and serving real data as of 2026-04-25 (live-verified).
+
+Later:
+- When Polymarket publishes a migration target, retarget GammaAdapter.
+
+Why deferred:
+- The endpoint is the only known discovery path for the BTC 5-min series today.
+- Switching speculatively risks more breakage than it prevents.
+
+Trigger to revisit:
+- Header flips to a hard 410 / 4xx response, OR
+- Polymarket publishes a deprecation notice with a replacement URL, OR
+- Discovery starts returning empty or stale data.

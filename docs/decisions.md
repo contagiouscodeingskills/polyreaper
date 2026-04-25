@@ -69,3 +69,31 @@ Reason:
 
 Status:
 - active
+
+
+## 7. Recorder VPS region
+Decision:
+- Recorder deploys to Hetzner Nuremberg (CX33: 4 vCPU / 8 GB / 80 GB NVMe / 20 TB).
+- Phase 1 goal is uninterrupted capture and replay-ready storage, not venue-latency optimization.
+
+Reason:
+- Stable, well-peered hosting reaches both Binance and Polymarket cleanly (verified live).
+- US-proximity for Polymarket is premature until a live trading bot is on the table.
+- Local residential ISP (AU) DNS-blocks Polymarket via the ACMA list; recording from a laptop on that network is impossible.
+
+Status:
+- active
+
+
+## 8. Resolution-source mismatch is research input, not a bug
+Decision:
+- Polymarket BTC 5-min up/down markets resolve via Chainlink BTC/USD price stream, not Binance Spot.
+- The recorder captures both Binance microstructure and Polymarket pricing as-is, with no attempt to align resolution sources.
+- Any cross-source delta (Chainlink reporting lag, off-Binance moves, Chainlink aggregation bias) is a research input downstream analysis can study.
+
+Reason:
+- The Chainlink → Binance basis is itself a candidate signal.
+- "Fixing" the mismatch by switching the recorder to Chainlink data would erase that signal before it can be measured.
+
+Status:
+- active
