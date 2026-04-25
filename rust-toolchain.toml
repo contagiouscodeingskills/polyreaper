@@ -1,0 +1,5 @@
+[toolchain]
+# `stable` (no host triple) resolves to `stable-<host>` where `<host>` is
+# rustup's `default-host` setting — MSVC on this Windows box, linux-gnu on
+# the VPS. See docs/SETUP_WINDOWS.md for the Windows prerequisite.
+channel = "stable"

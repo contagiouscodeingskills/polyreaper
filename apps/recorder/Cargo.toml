@@ -1,0 +1,19 @@
+[package]
+name = "recorder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+common          = { workspace = true }
+config          = { workspace = true }
+telemetry       = { workspace = true }
+storage         = { workspace = true }
+market_registry = { workspace = true }
+binance_feed    = { workspace = true }
+polymarket_feed = { workspace = true }
+
+tracing         = { workspace = true }
+tokio           = { workspace = true }

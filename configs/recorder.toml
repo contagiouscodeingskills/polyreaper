@@ -1,0 +1,45 @@
+# Sample recorder-phase config for local development.
+# Copy this file, edit paths/URLs, and pass the path to `recorder`.
+
+[app]
+environment = "dev"
+shutdown_grace_secs = 10
+
+[telemetry]
+# tracing EnvFilter syntax: "info", "recorder=debug,info", etc.
+log_level = "info"
+log_format = "pretty"   # "pretty" | "json"
+
+[storage]
+base_dir = "./data"
+rotate_minutes = 60     # 0 disables rotation
+fsync_on_write = false
+
+[binance_feed]
+ws_url = "wss://stream.binance.com:443/ws"
+# Binance wire names. Phase 1 records trades + 100ms depth diffs.
+streams = ["btcusdt@trade", "btcusdt@depth@100ms"]
+read_idle_secs = 30
+
+[binance_feed.reconnect]
+initial_ms = 500
+max_ms = 30000
+multiplier = 2.0
+
+[polymarket_feed]
+# TODO confirm endpoint against live behaviour. Best guess: the CLOB
+# "market" channel for book / BBO style updates.
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+read_idle_secs = 30
+
+[polymarket_feed.reconnect]
+initial_ms = 500
+max_ms = 30000
+multiplier = 2.0
+
+[market_discovery]
+# TODO verify endpoint + query shape for filtering BTC 5-minute up/down
+# markets. Title regex is a placeholder refined once we see real samples.
+gamma_url = "https://gamma-api.polymarket.com/markets"
+poll_interval_secs = 15
+title_pattern = "(?i)bitcoin.*(up or down).*5.*(min|minute)"

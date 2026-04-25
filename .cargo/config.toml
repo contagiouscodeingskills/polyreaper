@@ -1,0 +1,12 @@
+# MSVC toolchain config. Paths are machine-specific to this dev box
+# (VS 2019 Build Tools + Windows 10 SDK 10.0.19041.0). Documented as a
+# conscious single-developer choice in docs/TECH_DEBT.md §4 and
+# docs/decisions.md §6.
+
+[target.x86_64-pc-windows-msvc]
+# Explicit path so cargo doesn't pick up Git Bash's /usr/bin/link (coreutils).
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\bin\\Hostx64\\x64\\link.exe"
+
+[env]
+# link.exe searches LIB for kernel32.lib / msvcrt.lib / ucrt. No LIB = no link.
+LIB = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.19041.0\\um\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.19041.0\\ucrt\\x64"

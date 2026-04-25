@@ -1,0 +1,207 @@
+//! Shared primitive types for the PolyBot workspace.
+//!
+//! Keep this crate small: only types genuinely shared across recorder /
+//! replayer / researcher belong here. The single biggest thing it owns is
+//! [`RawEvent`] — the replay contract.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+pub const NAME: &str = "common";
+
+// ---------------------------------------------------------------------------
+// Venue
+// ---------------------------------------------------------------------------
+
+/// Venue identifier. Closed enum so downstream code cannot accidentally
+/// route Binance data into a Polymarket code path or vice versa.
+///
+/// Serializes as the lowercase venue name, keeping the wire format stable
+/// even if the Rust variant names are ever renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Venue {
+    Binance,
+    Polymarket,
+}
+
+impl Venue {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Venue::Binance => "binance",
+            Venue::Polymarket => "polymarket",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LocalTimestamp
+// ---------------------------------------------------------------------------
+
+/// Local receive timestamp, nanoseconds since the UNIX epoch.
+///
+/// Every inbound market-data event must carry one of these, stamped at the
+/// moment the bytes are handed to our process. This is the only clock we
+/// fully trust for ordering across venues.
+///
+/// **Wire format:** serialized as a decimal string (not a JSON number).
+/// Nanoseconds-since-epoch exceed JSON's 2^53 safe-integer range, so any
+/// consumer that parses JSON through an f64 (Python's `json` module,
+/// JavaScript, `jq`) would lose precision on a numeric encoding. A string
+/// preserves the value exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalTimestamp(u128);
+
+impl LocalTimestamp {
+    /// Capture the current wall-clock time.
+    pub fn now() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        Self(nanos)
+    }
+
+    pub fn from_nanos(nanos: u128) -> Self {
+        Self(nanos)
+    }
+
+    pub fn as_nanos(self) -> u128 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for LocalTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Matches the serialized form so log interpolation reads identically
+        // to NDJSON records.
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Serialize for LocalTimestamp {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalTimestamp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<u128>()
+            .map(LocalTimestamp)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RawEvent — the replay contract
+// ---------------------------------------------------------------------------
+
+/// The canonical shape every inbound venue message is wrapped in before
+/// persistence. NDJSON rows produced by the recorder deserialize into this
+/// exact type; this type is the replay contract.
+///
+/// Fields are owning so the event can move across channels / threads
+/// without lifetime juggling. The per-message allocations (one `String` for
+/// `stream`, one for `payload`) are deliberate — Phase 1 prioritises
+/// correctness and simplicity over allocator work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawEvent {
+    pub venue: Venue,
+
+    /// Venue-specific stream / channel identifier — e.g. `"btcusdt@trade"`
+    /// for Binance or a market id for Polymarket. Opaque to this crate;
+    /// kept so the replayer can route records without re-parsing payload.
+    pub stream: String,
+
+    /// Local receive timestamp, nanoseconds since epoch.
+    pub local_ts_ns: LocalTimestamp,
+
+    /// Venue-reported timestamp, milliseconds since epoch, if the payload
+    /// carried one. Kept separate from `local_ts_ns` so readers always know
+    /// which clock they're looking at.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub venue_ts_ms: Option<i64>,
+
+    /// Raw payload, exactly as received. UTF-8 text for Phase 1 (see
+    /// `docs/TECH_DEBT.md` §2 for binary support).
+    pub payload: String,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn venue_serializes_lowercase_and_round_trips() {
+        for v in [Venue::Binance, Venue::Polymarket] {
+            let s = serde_json::to_string(&v).unwrap();
+            assert_eq!(s, format!("\"{}\"", v.as_str()));
+            let parsed: Venue = serde_json::from_str(&s).unwrap();
+            assert_eq!(v, parsed);
+        }
+    }
+
+    #[test]
+    fn local_timestamp_serializes_as_string_to_preserve_precision() {
+        // 2^53 + 1 — the first integer that f64 cannot represent exactly.
+        // A numeric encoding would collapse this to 2^53 in any JSON parser
+        // that goes through f64.
+        let t = LocalTimestamp::from_nanos(9_007_199_254_740_993);
+        let s = serde_json::to_string(&t).unwrap();
+        assert_eq!(s, r#""9007199254740993""#);
+        let round: LocalTimestamp = serde_json::from_str(&s).unwrap();
+        assert_eq!(t, round);
+    }
+
+    #[test]
+    fn raw_event_round_trips_through_serde_json() {
+        let event = RawEvent {
+            venue: Venue::Polymarket,
+            stream: "market-X".into(),
+            local_ts_ns: LocalTimestamp::from_nanos(1_776_768_000_000_000_000),
+            venue_ts_ms: Some(1_776_768_000_000),
+            payload: r#"{"hello":"world"}"#.into(),
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let parsed: RawEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(event, parsed);
+    }
+
+    #[test]
+    fn venue_ts_ms_is_omitted_when_none() {
+        let event = RawEvent {
+            venue: Venue::Binance,
+            stream: "btcusdt@trade".into(),
+            local_ts_ns: LocalTimestamp::from_nanos(1),
+            venue_ts_ms: None,
+            payload: "x".into(),
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(!line.contains("venue_ts_ms"), "got {line}");
+    }
+
+    #[test]
+    fn raw_event_wire_format_is_self_documenting() {
+        // Locks the on-disk shape. Changing this test means changing the
+        // replay contract — NDJSON rows already on disk may stop loading.
+        let event = RawEvent {
+            venue: Venue::Binance,
+            stream: "btcusdt@trade".into(),
+            local_ts_ns: LocalTimestamp::from_nanos(1),
+            venue_ts_ms: Some(42),
+            payload: "p".into(),
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            line,
+            r#"{"venue":"binance","stream":"btcusdt@trade","local_ts_ns":"1","venue_ts_ms":42,"payload":"p"}"#
+        );
+    }
+}

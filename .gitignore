@@ -1,0 +1,22 @@
+# Build artifacts
+/target/
+**/target/
+
+# Runtime data — recorded NDJSON sessions
+/data/
+*.ndjson
+*.ndjson.zst
+
+# Editor / IDE metadata
+/.vscode/
+/.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Claude Code session state
+/.claude/
+
+# Local env / secrets
+/.env
+*.local.toml

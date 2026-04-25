@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/recorder",
+    "crates/common",
+    "crates/config",
+    "crates/telemetry",
+    "crates/storage",
+    "crates/market_registry",
+    "crates/binance_feed",
+    "crates/polymarket_feed",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "UNLICENSED"
+publish = false
+
+# Internal crates referenced via workspace deps so paths stay in one place.
+# External deps are pinned here so every crate shares the same version.
+[workspace.dependencies]
+common           = { path = "crates/common" }
+config           = { path = "crates/config" }
+telemetry        = { path = "crates/telemetry" }
+storage          = { path = "crates/storage" }
+market_registry  = { path = "crates/market_registry" }
+binance_feed     = { path = "crates/binance_feed" }
+polymarket_feed  = { path = "crates/polymarket_feed" }
+
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+toml               = "0.8"
+thiserror          = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio              = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio-tungstenite  = { version = "0.24", features = ["native-tls"] }
+futures-util       = { version = "0.3", default-features = false, features = ["std", "sink"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+regex              = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
