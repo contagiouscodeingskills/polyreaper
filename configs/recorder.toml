@@ -17,8 +17,10 @@ fsync_on_write = false
 
 [binance_feed]
 ws_url = "wss://stream.binance.com:443/ws"
-# Binance wire names. Phase 1 records trades + 100ms depth diffs.
-streams = ["btcusdt@trade", "btcusdt@depth@100ms"]
+# Binance wire names. `@bookTicker` ticks on every BBO change (sub-ms
+# cadence) — without it the finest top-of-book resolution is the 100 ms
+# depth diff, which is too coarse for sub-100 ms lead/lag analysis.
+streams = ["btcusdt@trade", "btcusdt@depth@100ms", "btcusdt@bookTicker"]
 read_idle_secs = 30
 
 [binance_feed.reconnect]
