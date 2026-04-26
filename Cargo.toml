@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/recorder",
+    "apps/replayer",
     "crates/common",
     "crates/config",
     "crates/telemetry",
@@ -11,6 +12,7 @@ members = [
     "crates/polymarket_feed",
     "crates/coinbase_feed",
     "crates/chainlink_feed",
+    "crates/replayer",
 ]
 
 [workspace.package]
@@ -32,6 +34,7 @@ binance_feed     = { path = "crates/binance_feed" }
 polymarket_feed  = { path = "crates/polymarket_feed" }
 coinbase_feed    = { path = "crates/coinbase_feed" }
 chainlink_feed   = { path = "crates/chainlink_feed" }
+replayer         = { path = "crates/replayer" }
 
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
@@ -44,6 +47,9 @@ tokio-tungstenite  = { version = "0.24", features = ["native-tls"] }
 futures-util       = { version = "0.3", default-features = false, features = ["std", "sink"] }
 reqwest            = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 regex              = "1"
+rust_decimal       = { version = "1", features = ["serde", "serde-with-str"] }
+arrow              = { version = "53", default-features = false }
+parquet            = { version = "53", default-features = false, features = ["arrow", "snap"] }
 
 [profile.release]
 opt-level = 3

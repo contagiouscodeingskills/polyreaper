@@ -19,7 +19,7 @@ pub const NAME: &str = "common";
 ///
 /// Serializes as the lowercase venue name, keeping the wire format stable
 /// even if the Rust variant names are ever renamed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Venue {
     Binance,
@@ -91,11 +91,45 @@ impl Serialize for LocalTimestamp {
 }
 
 impl<'de> Deserialize<'de> for LocalTimestamp {
+    /// Accepts both the current wire format (decimal string) and the
+    /// legacy format (JSON integer) used by sessions captured before
+    /// 2026-04-23. New writes always emit the string form; the lenient
+    /// reader keeps historical data reachable from the replayer.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse::<u128>()
-            .map(LocalTimestamp)
-            .map_err(serde::de::Error::custom)
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = u128;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("decimal string or non-negative integer of nanoseconds since UNIX epoch")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u128, E> {
+                v.parse::<u128>().map_err(E::custom)
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<u128, E> {
+                self.visit_str(&v)
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u128, E> {
+                Ok(v as u128)
+            }
+            fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<u128, E> {
+                Ok(v)
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u128, E> {
+                if v < 0 {
+                    Err(E::custom("negative timestamp"))
+                } else {
+                    Ok(v as u128)
+                }
+            }
+            fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<u128, E> {
+                if v < 0 {
+                    Err(E::custom("negative timestamp"))
+                } else {
+                    Ok(v as u128)
+                }
+            }
+        }
+        d.deserialize_any(V).map(LocalTimestamp)
     }
 }
 
@@ -150,6 +184,15 @@ mod tests {
             let parsed: Venue = serde_json::from_str(&s).unwrap();
             assert_eq!(v, parsed);
         }
+    }
+
+    #[test]
+    fn local_timestamp_deserialize_accepts_legacy_integer_form() {
+        // Sessions captured before 2026-04-23 wrote local_ts_ns as a JSON
+        // integer. The replayer must still load them.
+        let legacy = r#"1776944389779198900"#;
+        let parsed: LocalTimestamp = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.as_nanos(), 1776944389779198900);
     }
 
     #[test]

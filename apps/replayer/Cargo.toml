@@ -1,0 +1,21 @@
+[package]
+name = "replayer-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "replayer"
+path = "src/main.rs"
+
+[dependencies]
+replayer   = { workspace = true, features = ["parquet"] }
+common     = { workspace = true }
+tracing    = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+storage = { workspace = true }
+config  = { workspace = true }
