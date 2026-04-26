@@ -30,7 +30,10 @@ multiplier = 2.0
 # TODO confirm endpoint against live behaviour. Best guess: the CLOB
 # "market" channel for book / BBO style updates.
 ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-read_idle_secs = 30
+# 22h soak observed ~46 reconnects/hour at 30s — Polymarket goes quiet
+# during low-trade lulls. 120s lets ping/pong keep us alive while still
+# detecting dead connections within 2 min.
+read_idle_secs = 120
 
 [polymarket_feed.reconnect]
 initial_ms = 500
@@ -64,7 +67,11 @@ multiplier = 2.0
 ws_url = "wss://ethereum-rpc.publicnode.com"
 # Chainlink BTC/USD AggregatorV3 on Ethereum Mainnet.
 contract_address = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
-read_idle_secs = 60
+# On-chain BTC/USD updates ~hourly (heartbeat) or on >0.5% deviation.
+# 60s idle was forcing a reconnect every minute, missing every event.
+# 600s lets the connection stay alive between events; TCP keepalive
+# detects truly dead sockets within ~2 min anyway.
+read_idle_secs = 600
 [chainlink_feed.reconnect]
 initial_ms = 1000
 max_ms = 60000

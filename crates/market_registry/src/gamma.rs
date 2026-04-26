@@ -62,12 +62,16 @@ impl GammaAdapter {
     /// markets (BTC 5m has ~200). Pagination is a future addition if a
     /// series ever exceeds that.
     async fn fetch_raw_json(&self) -> Result<String, DiscoveryError> {
+        // `series_slug` is a gamma-side filter — surfaces only events in
+        // our series, no need to scan + drop 90% client-side. Verified
+        // 2026-04-26: returns 100% match.
         let resp = self
             .client
             .get(&self.base_url)
             .query(&[
                 ("active", "true"),
                 ("closed", "false"),
+                ("series_slug", self.series_slug.as_str()),
                 ("order", "startDate"),
                 ("ascending", "false"),
                 ("limit", "500"),
@@ -194,12 +198,16 @@ impl GammaAdapter {
     /// resolution-sweep loop to capture Up/Down ground-truth labels for
     /// markets whose trading window has ended.
     pub async fn fetch_resolved_events(&self) -> Result<Vec<ResolvedMarket>, DiscoveryError> {
+        // Crucial: `series_slug` filter. Without it, closed btc-up-or-down-5m
+        // events are paginated past offset 1000 — the first 500 results
+        // contain none, so the original sweeper found nothing for 22 h.
         let resp = self
             .client
             .get(&self.base_url)
             .query(&[
                 ("closed", "true"),
                 ("archived", "false"),
+                ("series_slug", self.series_slug.as_str()),
                 ("order", "endDate"),
                 ("ascending", "false"),
                 ("limit", "500"),
