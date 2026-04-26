@@ -5,6 +5,7 @@
 //! (Ctrl-C), then aborts the feed task and flushes storage with a bounded
 //! grace window.
 
+mod health;
 mod latency;
 mod sweep;
 
@@ -197,12 +198,17 @@ async fn main() -> ExitCode {
         "latency probe spawned"
     );
 
-    // 5. Feeds — Binance + Polymarket, both as independent tokio tasks.
+    // 5. Feeds — one tokio task per venue.
+    //
+    // Each FeedStats is `Clone` (Arc-backed counters). We clone once
+    // for the feed task and keep the original to hand to the health
+    // writer below — both views share the same atomic counters.
+    let binance_stats = binance_feed::FeedStats::new();
     let binance_cfg = cfg.binance_feed.clone();
     let binance_store = Arc::clone(&store);
-    let binance_stats = binance_feed::FeedStats::new();
+    let binance_stats_for_feed = binance_stats.clone();
     let binance_handle = tokio::spawn(async move {
-        binance_feed::run(&binance_cfg, binance_store, binance_stats).await
+        binance_feed::run(&binance_cfg, binance_store, binance_stats_for_feed).await
     });
     tracing::info!(
         component = "recorder",
@@ -211,16 +217,17 @@ async fn main() -> ExitCode {
         "binance feed task spawned"
     );
 
+    let polymarket_stats = polymarket_feed::FeedStats::new();
     let polymarket_cfg = cfg.polymarket_feed.clone();
     let polymarket_store = Arc::clone(&store);
     let polymarket_registry = Arc::clone(&registry);
-    let polymarket_stats = polymarket_feed::FeedStats::new();
+    let polymarket_stats_for_feed = polymarket_stats.clone();
     let polymarket_handle = tokio::spawn(async move {
         polymarket_feed::run(
             &polymarket_cfg,
             polymarket_registry,
             polymarket_store,
-            polymarket_stats,
+            polymarket_stats_for_feed,
         )
         .await
     });
@@ -231,11 +238,12 @@ async fn main() -> ExitCode {
         "polymarket feed task spawned"
     );
 
+    let coinbase_stats = coinbase_feed::FeedStats::new();
     let coinbase_cfg = cfg.coinbase_feed.clone();
     let coinbase_store = Arc::clone(&store);
-    let coinbase_stats = coinbase_feed::FeedStats::new();
+    let coinbase_stats_for_feed = coinbase_stats.clone();
     let coinbase_handle = tokio::spawn(async move {
-        coinbase_feed::run(&coinbase_cfg, coinbase_store, coinbase_stats).await
+        coinbase_feed::run(&coinbase_cfg, coinbase_store, coinbase_stats_for_feed).await
     });
     tracing::info!(
         component = "recorder",
@@ -244,17 +252,45 @@ async fn main() -> ExitCode {
         "coinbase feed task spawned"
     );
 
+    let chainlink_stats = chainlink_feed::FeedStats::new();
     let chainlink_cfg = cfg.chainlink_feed.clone();
     let chainlink_store = Arc::clone(&store);
-    let chainlink_stats = chainlink_feed::FeedStats::new();
+    let chainlink_stats_for_feed = chainlink_stats.clone();
     let chainlink_handle = tokio::spawn(async move {
-        chainlink_feed::run(&chainlink_cfg, chainlink_store, chainlink_stats).await
+        chainlink_feed::run(&chainlink_cfg, chainlink_store, chainlink_stats_for_feed).await
     });
     tracing::info!(
         component = "recorder",
         event = "feed_spawned",
         venue = "chainlink",
         "chainlink feed task spawned"
+    );
+
+    // Health snapshot writer — appends to <session>/_health.ndjson every
+    // 30 s. Used by research notebooks to filter analysis windows by
+    // data quality + clock state. Independent from each feed's own
+    // journald `health` log line (which goes to telemetry, not disk).
+    let health_inputs = {
+        let session_dir = store
+            .lock()
+            .map(|g| g.session_dir().to_path_buf())
+            .unwrap_or_else(|p| p.into_inner().session_dir().to_path_buf());
+        health::HealthInputs {
+            session_dir,
+            binance: binance_stats,
+            polymarket: polymarket_stats,
+            coinbase: coinbase_stats,
+            chainlink: chainlink_stats,
+        }
+    };
+    let health_handle = tokio::spawn(async move {
+        health::run_health_writer_loop(health_inputs, Duration::from_secs(30)).await
+    });
+    tracing::info!(
+        component = "recorder",
+        event = "health_writer_spawned",
+        interval_secs = 30,
+        "health snapshot writer spawned"
     );
 
     // 6. Wait for a shutdown signal (SIGTERM/SIGINT on unix, Ctrl-C on win).
@@ -282,6 +318,7 @@ async fn main() -> ExitCode {
     discovery_handle.abort();
     resolution_handle.abort();
     latency_handle.abort();
+    health_handle.abort();
     let _ = binance_handle.await;
     let _ = polymarket_handle.await;
     let _ = coinbase_handle.await;
@@ -289,6 +326,7 @@ async fn main() -> ExitCode {
     let _ = discovery_handle.await;
     let _ = resolution_handle.await;
     let _ = latency_handle.await;
+    let _ = health_handle.await;
 
     // 8. Best-effort flush with a bounded grace window.
     let grace = Duration::from_secs(cfg.app.shutdown_grace_secs.max(1));
