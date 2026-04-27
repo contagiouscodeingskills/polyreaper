@@ -43,7 +43,7 @@ use crate::decode::{
 use crate::DecodedEvent;
 use crate::ReplayError;
 
-/// Maximum number of pre-snapshot price-changes to hold per side.
+/// Maximum number of pre-snapshot price-change items to hold per side.
 /// Above this we warn and drop the oldest. Polymarket's snapshot
 /// cadence is 1/connection so this cap is mostly insurance against
 /// pathological recordings; live captures rarely exceed single digits.
@@ -157,6 +157,15 @@ impl PolymarketSideBook {
 /// for Yes and No outcomes. (Get these from the `market_registry`
 /// crate at the call site — the replayer crate doesn't depend on the
 /// registry to keep its dep graph small.)
+/// One buffered pre-snapshot item, with the parent event's
+/// `timestamp_ms` carried alongside so [`replay_pending`] can decide
+/// whether the snapshot already absorbed it.
+#[derive(Debug, Clone)]
+struct PendingItem {
+    timestamp_ms: Option<i64>,
+    item: PolymarketPriceChangeItem,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolymarketMarketBook {
     market: String,
@@ -164,11 +173,11 @@ pub struct PolymarketMarketBook {
     no_asset_id: String,
     yes_book: PolymarketSideBook,
     no_book: PolymarketSideBook,
-    /// Per-side buffer of price_changes that arrived before that
+    /// Per-side buffer of price-change items that arrived before that
     /// side's snapshot. Replayed after the snapshot lands; trimmed to
     /// `MAX_BUFFER` (drop oldest) so a runaway recording can't OOM us.
-    yes_pending: VecDeque<PolymarketPriceChange>,
-    no_pending: VecDeque<PolymarketPriceChange>,
+    yes_pending: VecDeque<PendingItem>,
+    no_pending: VecDeque<PendingItem>,
 }
 
 impl PolymarketMarketBook {
@@ -230,16 +239,49 @@ impl PolymarketMarketBook {
         // Else: snapshot for an asset_id we don't track — silently ignore.
     }
 
-    /// Apply (or buffer) a `price_change` for whichever side it
-    /// targets. Returns `Skipped` if the change is for an unrelated
-    /// `asset_id`, `Applied` if it touched our state (whether by
-    /// updating the live book or being buffered).
+    /// Apply (or buffer) each item of a `price_change` independently.
+    /// One wire batch can carry items for both Yes and No assets, so
+    /// routing is per-item. Items targeting an `asset_id` we don't
+    /// track are silently skipped. Returns `Applied` if at least one
+    /// item touched our state, `Skipped` if none did.
     pub fn apply_price_change(&mut self, p: &PolymarketPriceChange) -> ApplyOutcome {
-        if p.asset_id == self.yes_asset_id {
-            apply_or_buffer(&mut self.yes_book, &mut self.yes_pending, p);
-            ApplyOutcome::Applied
-        } else if p.asset_id == self.no_asset_id {
-            apply_or_buffer(&mut self.no_book, &mut self.no_pending, p);
+        enum Target {
+            Yes,
+            No,
+            Skip,
+        }
+        let mut applied_any = false;
+        for item in &p.price_changes {
+            let target = if item.asset_id == self.yes_asset_id {
+                Target::Yes
+            } else if item.asset_id == self.no_asset_id {
+                Target::No
+            } else {
+                Target::Skip
+            };
+            match target {
+                Target::Yes => {
+                    apply_or_buffer_item(
+                        &mut self.yes_book,
+                        &mut self.yes_pending,
+                        p.timestamp_ms,
+                        item,
+                    );
+                    applied_any = true;
+                }
+                Target::No => {
+                    apply_or_buffer_item(
+                        &mut self.no_book,
+                        &mut self.no_pending,
+                        p.timestamp_ms,
+                        item,
+                    );
+                    applied_any = true;
+                }
+                Target::Skip => {}
+            }
+        }
+        if applied_any {
             ApplyOutcome::Applied
         } else {
             ApplyOutcome::Skipped
@@ -257,36 +299,36 @@ impl PolymarketMarketBook {
 // helpers
 // ---------------------------------------------------------------------------
 
-fn apply_or_buffer(
+fn apply_or_buffer_item(
     side: &mut PolymarketSideBook,
-    pending: &mut VecDeque<PolymarketPriceChange>,
-    p: &PolymarketPriceChange,
+    pending: &mut VecDeque<PendingItem>,
+    timestamp_ms: Option<i64>,
+    item: &PolymarketPriceChangeItem,
 ) {
     if side.has_snapshot {
-        for item in &p.price_changes {
-            side.apply_price_change_item(item);
-        }
+        side.apply_price_change_item(item);
     } else {
         if pending.len() >= MAX_BUFFER {
             tracing::warn!(
                 component = "replayer",
-                market = %p.market,
-                asset_id = %p.asset_id,
+                asset_id = %item.asset_id,
                 buffered = pending.len(),
                 cap = MAX_BUFFER,
-                "polymarket pre-snapshot buffer full; dropping oldest"
+                "polymarket pre-snapshot buffer full; dropping oldest item"
             );
             pending.pop_front();
         }
-        pending.push_back(p.clone());
+        pending.push_back(PendingItem {
+            timestamp_ms,
+            item: item.clone(),
+        });
     }
 }
 
-fn replay_pending(pending: &mut VecDeque<PolymarketPriceChange>, side: &mut PolymarketSideBook) {
+fn replay_pending(pending: &mut VecDeque<PendingItem>, side: &mut PolymarketSideBook) {
     let snapshot_ts = side.last_snapshot_ts_ms;
-    while let Some(pc) = pending.pop_front() {
-        let pc_ts = pc.timestamp_ms;
-        let strictly_after = match (snapshot_ts, pc_ts) {
+    while let Some(p) = pending.pop_front() {
+        let strictly_after = match (snapshot_ts, p.timestamp_ms) {
             (Some(snap_ts), Some(t)) => t > snap_ts,
             // If either is missing we can't compare — replay anyway.
             // Safer to over-apply (the change is at most a no-op since
@@ -294,9 +336,7 @@ fn replay_pending(pending: &mut VecDeque<PolymarketPriceChange>, side: &mut Poly
             _ => true,
         };
         if strictly_after {
-            for item in &pc.price_changes {
-                side.apply_price_change_item(item);
-            }
+            side.apply_price_change_item(&p.item);
         }
     }
 }
@@ -340,6 +380,9 @@ mod tests {
         }
     }
 
+    /// Build a `PolymarketPriceChange` whose every item shares the
+    /// supplied `asset_id`. For cross-asset batches, construct the
+    /// struct inline.
     fn pc(
         asset_id: &str,
         market: &str,
@@ -348,13 +391,12 @@ mod tests {
     ) -> PolymarketPriceChange {
         PolymarketPriceChange {
             local_ts_ns: 0,
-            asset_id: asset_id.into(),
             market: market.into(),
             timestamp_ms: Some(ts),
-            hash: None,
             price_changes: items
                 .iter()
                 .map(|(side, price, size)| PolymarketPriceChangeItem {
+                    asset_id: asset_id.into(),
                     price: d(price),
                     size: d(size),
                     side: *side,
@@ -509,5 +551,72 @@ mod tests {
             value: serde_json::json!({"foo":"bar"}),
         };
         assert_eq!(m.apply(&unknown).unwrap(), ApplyOutcome::Skipped);
+    }
+
+    #[test]
+    fn batch_with_items_for_both_assets_updates_both_books() {
+        let mut m = fresh();
+        // Snapshot both sides so items apply immediately.
+        m.apply_book(&book("YES", "0xMKT", 100, &[("0.50", "10")], &[("0.51", "5")]));
+        m.apply_book(&book("NO", "0xMKT", 100, &[("0.49", "10")], &[("0.50", "5")]));
+
+        // One wire batch whose items target different assets.
+        let p = PolymarketPriceChange {
+            local_ts_ns: 0,
+            market: "0xMKT".into(),
+            timestamp_ms: Some(200),
+            price_changes: vec![
+                PolymarketPriceChangeItem {
+                    asset_id: "YES".into(),
+                    price: d("0.50"),
+                    size: d("20"),
+                    side: PolymarketSide::Buy,
+                    best_bid: None,
+                    best_ask: None,
+                    hash: None,
+                },
+                PolymarketPriceChangeItem {
+                    asset_id: "NO".into(),
+                    price: d("0.49"),
+                    size: d("0"), // remove this level
+                    side: PolymarketSide::Buy,
+                    best_bid: None,
+                    best_ask: None,
+                    hash: None,
+                },
+            ],
+        };
+        let outcome = m
+            .apply(&DecodedEvent::PolymarketPriceChange(p))
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        // YES bid updated from 10 → 20 at 0.50.
+        assert_eq!(m.yes_book().best_bid(), Some((d("0.50"), d("20"))));
+        // NO bid at 0.49 removed.
+        assert_eq!(m.no_book().best_bid(), None);
+    }
+
+    #[test]
+    fn batch_with_no_matching_assets_returns_skipped() {
+        let mut m = fresh();
+        m.apply_book(&book("YES", "0xMKT", 100, &[("0.50", "10")], &[]));
+        let p = PolymarketPriceChange {
+            local_ts_ns: 0,
+            market: "0xMKT".into(),
+            timestamp_ms: Some(200),
+            price_changes: vec![PolymarketPriceChangeItem {
+                asset_id: "OTHER".into(),
+                price: d("0.50"),
+                size: d("99"),
+                side: PolymarketSide::Buy,
+                best_bid: None,
+                best_ask: None,
+                hash: None,
+            }],
+        };
+        let outcome = m
+            .apply(&DecodedEvent::PolymarketPriceChange(p))
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Skipped);
     }
 }

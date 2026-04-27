@@ -81,17 +81,18 @@ struct WireBook {
 // price_change
 // ---------------------------------------------------------------------------
 
-/// Batch of price-level diffs for one market (often one side, one tick).
-///
-/// Each `PolymarketPriceChangeItem` is one level update; the batch
-/// shares a `timestamp` and `hash`.
+/// Batch of price-level diffs for one market — possibly spanning both
+/// outcome tokens (Yes and No) in a single wire frame. Each
+/// [`PolymarketPriceChangeItem`] carries its own `asset_id`, so routing
+/// to a per-side book is per-item, not per-event. The batch is just a
+/// market-scoped envelope sharing `timestamp`; `asset_id` and `hash`
+/// live on the items, not the batch (verified against live wire on
+/// 2026-04-26).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolymarketPriceChange {
     pub local_ts_ns: u128,
-    pub asset_id: String,
     pub market: String,
     pub timestamp_ms: Option<i64>,
-    pub hash: Option<String>,
     pub price_changes: Vec<PolymarketPriceChangeItem>,
 }
 
@@ -105,13 +106,18 @@ pub enum PolymarketSide {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PolymarketPriceChangeItem {
+    /// Token id this item updates. One wire batch can carry items for
+    /// both the Yes-token and No-token of the same market, so this
+    /// drives per-item routing during book reconstruction.
+    pub asset_id: String,
     #[serde(with = "rust_decimal::serde::str")]
     pub price: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub size: Decimal,
     pub side: PolymarketSide,
     /// Best opposing prices reported alongside the change. Optional
-    /// because not every Polymarket version emits them.
+    /// because older Polymarket versions omitted them; live wire
+    /// (verified 2026-04-26) always emits both.
     #[serde(default, with = "opt_decimal_str")]
     pub best_bid: Option<Decimal>,
     #[serde(default, with = "opt_decimal_str")]
@@ -119,12 +125,15 @@ pub struct PolymarketPriceChangeItem {
     pub hash: Option<String>,
 }
 
+// Real wire never carries `asset_id` or `hash` at the top level of a
+// price_change event (verified 2026-04-26 against a 13 h capture);
+// `asset_id` lives on each `price_changes[]` item. Serde silently
+// ignores extra wire fields, so this stays robust if Polymarket adds
+// more later.
 #[derive(Deserialize)]
 struct WirePriceChange {
-    asset_id: String,
     market: String,
     timestamp: Option<String>,
-    hash: Option<String>,
     #[serde(default)]
     price_changes: Vec<PolymarketPriceChangeItem>,
 }
@@ -296,10 +305,8 @@ pub(super) fn decode(
                 })?;
             Ok(DecodedEvent::PolymarketPriceChange(PolymarketPriceChange {
                 local_ts_ns,
-                asset_id: w.asset_id,
                 market: w.market,
                 timestamp_ms: parse_ts_ms(w.timestamp.as_deref()),
-                hash: w.hash,
                 price_changes: w.price_changes,
             }))
         }
@@ -572,12 +579,11 @@ mod tests {
 
     const PRICE_CHANGE: &str = r#"{
         "event_type":"price_change",
-        "asset_id":"YES-TOK","market":"0xMKT",
+        "market":"0xMKT",
         "timestamp":"1750000000999",
-        "hash":"0x1",
         "price_changes":[
-            {"price":"0.6200","size":"100","side":"BUY","best_bid":"0.6200","best_ask":"0.6300"},
-            {"price":"0.6300","size":"0","side":"SELL"}
+            {"asset_id":"YES-TOK","price":"0.6200","size":"100","side":"BUY","best_bid":"0.6200","best_ask":"0.6300","hash":"0xa"},
+            {"asset_id":"YES-TOK","price":"0.6300","size":"0","side":"SELL"}
         ]
     }"#;
 
@@ -586,16 +592,57 @@ mod tests {
         let e = decode(0, "btc-updown-5m-1", PRICE_CHANGE).unwrap();
         match e {
             DecodedEvent::PolymarketPriceChange(p) => {
+                assert_eq!(p.market, "0xMKT");
                 assert_eq!(p.price_changes.len(), 2);
+                // First item: full real-wire shape — asset_id + best_bid/ask + hash.
+                assert_eq!(p.price_changes[0].asset_id, "YES-TOK");
                 assert_eq!(p.price_changes[0].side, PolymarketSide::Buy);
                 assert_eq!(
                     p.price_changes[0].best_bid,
                     Some(Decimal::from_str("0.6200").unwrap())
                 );
-                // Second item has neither best_bid nor best_ask
+                assert_eq!(p.price_changes[0].hash.as_deref(), Some("0xa"));
+                // Second item: legacy/edge case — Optionals absent.
+                assert_eq!(p.price_changes[1].asset_id, "YES-TOK");
                 assert_eq!(p.price_changes[1].side, PolymarketSide::Sell);
                 assert_eq!(p.price_changes[1].best_bid, None);
+                assert_eq!(p.price_changes[1].best_ask, None);
+                assert_eq!(p.price_changes[1].hash, None);
                 assert_eq!(p.price_changes[1].size, Decimal::ZERO);
+            }
+            _ => panic!("expected PolymarketPriceChange"),
+        }
+    }
+
+    /// Mirror of the real wire shape captured 2026-04-26: no top-level
+    /// asset_id, every item carries its own asset_id + best_bid/ask +
+    /// hash, two items per batch (one BUY one SELL).
+    const PRICE_CHANGE_REAL_WIRE: &str = r#"{
+        "event_type":"price_change",
+        "market":"0xbd31dc8a20211944f6b70f31557f1001557b59905b7738480ca09bd4532f84af",
+        "timestamp":"1750000001234",
+        "price_changes":[
+            {"asset_id":"658186","best_ask":"0.5500","best_bid":"0.5400","hash":"0xh1","price":"0.5400","side":"BUY","size":"42"},
+            {"asset_id":"658186","best_ask":"0.5500","best_bid":"0.5400","hash":"0xh2","price":"0.5500","side":"SELL","size":"17"}
+        ]
+    }"#;
+
+    #[test]
+    fn decodes_real_wire_shape_price_change() {
+        let e = decode(0, "btc-updown-5m-1", PRICE_CHANGE_REAL_WIRE).unwrap();
+        match e {
+            DecodedEvent::PolymarketPriceChange(p) => {
+                assert_eq!(p.price_changes.len(), 2);
+                assert_eq!(p.price_changes[0].asset_id, "658186");
+                assert_eq!(p.price_changes[1].asset_id, "658186");
+                assert_eq!(p.price_changes[0].side, PolymarketSide::Buy);
+                assert_eq!(p.price_changes[1].side, PolymarketSide::Sell);
+                // Real wire always populates these per-item Optional fields.
+                assert!(p.price_changes[0].best_bid.is_some());
+                assert!(p.price_changes[0].best_ask.is_some());
+                assert!(p.price_changes[0].hash.is_some());
+                assert!(p.price_changes[1].best_bid.is_some());
+                assert!(p.price_changes[1].hash.is_some());
             }
             _ => panic!("expected PolymarketPriceChange"),
         }
