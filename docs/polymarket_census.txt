@@ -1,0 +1,54 @@
+=== polymarket dir summary ===
+22G	/home/polybot/polybot/data/session_20260426T122347Z/polymarket
+files: 4773
+
+=== top 5 .0000.ndjson files by size ===
+ 119255721  /home/polybot/polybot/data/session_20260426T122347Z/polymarket/btc-updown-5m-1777208100.0000.ndjson
+ 119000081  /home/polybot/polybot/data/session_20260426T122347Z/polymarket/btc-updown-5m-1777209000.0000.ndjson
+ 114954195  /home/polybot/polybot/data/session_20260426T122347Z/polymarket/btc-updown-5m-1777206600.0000.ndjson
+ 111578943  /home/polybot/polybot/data/session_20260426T122347Z/polymarket/btc-updown-5m-1777209300.0000.ndjson
+ 110189960  /home/polybot/polybot/data/session_20260426T122347Z/polymarket/btc-updown-5m-1777207800.0000.ndjson
+
+=== event-type distribution + payload keys (first 1000 lines per file) ===
+-- btc-updown-5m-1777208100.0000.ndjson (114M) --
+   price_change           941
+   book                   40
+   last_trade_price       19
+   keys[book]: ['asks', 'asset_id', 'bids', 'event_type', 'hash', 'last_trade_price', 'market', 'tick_size', 'timestamp']
+   keys[price_change]: ['event_type', 'market', 'price_changes', 'timestamp']
+   keys[last_trade_price]: ['asset_id', 'event_type', 'fee_rate_bps', 'market', 'price', 'side', 'size', 'timestamp', 'transaction_hash']
+-- btc-updown-5m-1777209000.0000.ndjson (114M) --
+   price_change           950
+   book                   34
+   last_trade_price       16
+   keys[book]: ['asks', 'asset_id', 'bids', 'event_type', 'hash', 'last_trade_price', 'market', 'tick_size', 'timestamp']
+   keys[price_change]: ['event_type', 'market', 'price_changes', 'timestamp']
+   keys[last_trade_price]: ['asset_id', 'event_type', 'fee_rate_bps', 'market', 'price', 'side', 'size', 'timestamp', 'transaction_hash']
+-- btc-updown-5m-1777206600.0000.ndjson (110M) --
+   price_change           953
+   book                   32
+   last_trade_price       15
+   keys[book]: ['asks', 'asset_id', 'bids', 'event_type', 'hash', 'last_trade_price', 'market', 'tick_size', 'timestamp']
+   keys[price_change]: ['event_type', 'market', 'price_changes', 'timestamp']
+   keys[last_trade_price]: ['asset_id', 'event_type', 'fee_rate_bps', 'market', 'price', 'side', 'size', 'timestamp', 'transaction_hash']
+-- btc-updown-5m-1777209300.0000.ndjson (107M) --
+   price_change           956
+   book                   30
+   last_trade_price       14
+   keys[book]: ['asks', 'asset_id', 'bids', 'event_type', 'hash', 'last_trade_price', 'market', 'tick_size', 'timestamp']
+   keys[price_change]: ['event_type', 'market', 'price_changes', 'timestamp']
+   keys[last_trade_price]: ['asset_id', 'event_type', 'fee_rate_bps', 'market', 'price', 'side', 'size', 'timestamp', 'transaction_hash']
+-- btc-updown-5m-1777207800.0000.ndjson (106M) --
+   price_change           962
+   book                   26
+   last_trade_price       12
+   keys[book]: ['asks', 'asset_id', 'bids', 'event_type', 'hash', 'last_trade_price', 'market', 'tick_size', 'timestamp']
+   keys[price_change]: ['event_type', 'market', 'price_changes', 'timestamp']
+   keys[last_trade_price]: ['asset_id', 'event_type', 'fee_rate_bps', 'market', 'price', 'side', 'size', 'timestamp', 'transaction_hash']
+
+=== resolution-sweeper sample (one file, first 100 lines) ===
+-- btc-updown-5m-1777055700-resolved.0000.ndjson (0) --
+   records parsed: 0
+   union of payload keys: []
+
+=== _unrouted / _unknown_* files ===

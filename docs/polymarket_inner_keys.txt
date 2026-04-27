@@ -1,0 +1,62 @@
+=== btc-updown-5m-1777208100.0000.ndjson ===
+-- book bids[0] / asks[0] shape --
+  sample 0: bids=42 asks=41
+    bids[0] keys+types: [('price', 'str'), ('size', 'str')]
+    asks[0] keys+types: [('price', 'str'), ('size', 'str')]
+  sample 1: bids=41 asks=42
+    bids[0] keys+types: [('price', 'str'), ('size', 'str')]
+    asks[0] keys+types: [('price', 'str'), ('size', 'str')]
+  sample 2: bids=42 asks=41
+    bids[0] keys+types: [('price', 'str'), ('size', 'str')]
+    asks[0] keys+types: [('price', 'str'), ('size', 'str')]
+-- price_change top-level + price_changes[0..1] shape --
+  sample 0: top keys: ['event_type', 'market', 'price_changes', 'timestamp']
+    price_changes count: 2
+    price_changes[0] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[0].side value: 'BUY'
+    price_changes[1] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[1].side value: 'SELL'
+  sample 1: top keys: ['event_type', 'market', 'price_changes', 'timestamp']
+    price_changes count: 2
+    price_changes[0] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[0].side value: 'BUY'
+    price_changes[1] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[1].side value: 'SELL'
+  sample 2: top keys: ['event_type', 'market', 'price_changes', 'timestamp']
+    price_changes count: 2
+    price_changes[0] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[0].side value: 'BUY'
+    price_changes[1] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[1].side value: 'SELL'
+  distinct side values seen: ['BUY', 'SELL']
+=== btc-updown-5m-1777209000.0000.ndjson ===
+-- book bids[0] / asks[0] shape --
+  sample 0: bids=49 asks=49
+    bids[0] keys+types: [('price', 'str'), ('size', 'str')]
+    asks[0] keys+types: [('price', 'str'), ('size', 'str')]
+  sample 1: bids=49 asks=49
+    bids[0] keys+types: [('price', 'str'), ('size', 'str')]
+    asks[0] keys+types: [('price', 'str'), ('size', 'str')]
+  sample 2: bids=50 asks=49
+    bids[0] keys+types: [('price', 'str'), ('size', 'str')]
+    asks[0] keys+types: [('price', 'str'), ('size', 'str')]
+-- price_change top-level + price_changes[0..1] shape --
+  sample 0: top keys: ['event_type', 'market', 'price_changes', 'timestamp']
+    price_changes count: 2
+    price_changes[0] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[0].side value: 'BUY'
+    price_changes[1] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[1].side value: 'SELL'
+  sample 1: top keys: ['event_type', 'market', 'price_changes', 'timestamp']
+    price_changes count: 2
+    price_changes[0] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[0].side value: 'BUY'
+    price_changes[1] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[1].side value: 'SELL'
+  sample 2: top keys: ['event_type', 'market', 'price_changes', 'timestamp']
+    price_changes count: 2
+    price_changes[0] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[0].side value: 'BUY'
+    price_changes[1] keys+types: [('asset_id', 'str'), ('best_ask', 'str'), ('best_bid', 'str'), ('hash', 'str'), ('price', 'str'), ('side', 'str'), ('size', 'str')]
+    price_changes[1].side value: 'SELL'
+  distinct side values seen: ['BUY', 'SELL']
