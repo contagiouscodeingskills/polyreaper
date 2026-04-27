@@ -14,6 +14,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{frame, snapshot, FeedStats};
 
+/// How often we re-fetch the REST depth snapshot during a single WS
+/// connection. The recorder also fetches one on each connect; this guards
+/// against the case where the connection stays up for hours but a single
+/// depth diff is dropped, leaving replay's reconstructed book stale until
+/// the next reconnect.
+const SNAPSHOT_INTERVAL_SECS: u64 = 600;
+
 pub(crate) async fn connect_forever(
     cfg: &config::BinanceFeedConfig,
     store: Arc<Mutex<storage::Store>>,
@@ -127,6 +134,41 @@ async fn connect_once(
         }
     }
 
+    // Keep the book fresh: re-fetch the snapshot on a fixed interval while
+    // this connection is up. A single missed depth diff would otherwise
+    // leave the reconstructed book wrong until the next reconnect. The
+    // guard is dropped when this function returns, aborting the task.
+    let _periodic_snapshot = snapshot::extract_symbol(&cfg.streams).map(|symbol| {
+        let store = Arc::clone(store);
+        AbortOnDrop(tokio::spawn(run_periodic(
+            Duration::from_secs(SNAPSHOT_INTERVAL_SECS),
+            move || {
+                let symbol = symbol.clone();
+                let store = Arc::clone(&store);
+                async move {
+                    match snapshot::fetch_and_persist(&symbol, &store).await {
+                        Ok(()) => tracing::info!(
+                            component = "binance_feed",
+                            venue = "binance",
+                            event = "snapshot_persisted",
+                            symbol = %symbol,
+                            periodic = true,
+                            "periodic depth snapshot persisted"
+                        ),
+                        Err(e) => tracing::warn!(
+                            component = "binance_feed",
+                            venue = "binance",
+                            event = "snapshot_failed",
+                            periodic = true,
+                            reason = %e,
+                            "periodic depth snapshot fetch failed"
+                        ),
+                    }
+                }
+            },
+        )))
+    });
+
     // Read loop. Any error, idle timeout, or clean close returns and the
     // outer loop backs off.
     let idle = Duration::from_secs(cfg.read_idle_secs);
@@ -207,6 +249,37 @@ pub(crate) fn backoff_delay(attempt: u32, cfg: &config::ReconnectBackoff) -> Dur
     Duration::from_millis(ms)
 }
 
+/// Run `action` every `interval`, skipping the immediate first tick. The
+/// caller is expected to have just performed the action once already (the
+/// initial REST snapshot fired on connect), so we don't fire again at
+/// t=0 — only at t=interval, t=2*interval, .... Cancellation comes from
+/// aborting the spawning JoinHandle (see [`AbortOnDrop`]).
+async fn run_periodic<F, Fut>(interval: Duration, mut action: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // skip immediate first tick
+    loop {
+        ticker.tick().await;
+        action().await;
+    }
+}
+
+/// RAII wrapper that aborts the contained task when dropped. Used to scope
+/// the periodic snapshot task to a single WS connection: when `connect_once`
+/// returns, the guard drops and the periodic task stops, so the next
+/// connect starts from a clean baseline.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -247,5 +320,36 @@ mod tests {
             backoff_delay(20, &cfg),
             Duration::from_millis(30_000)
         );
+    }
+
+    #[tokio::test]
+    async fn run_periodic_skips_immediate_then_fires_each_interval() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let count = Arc::new(AtomicU32::new(0));
+        let task = {
+            let count = Arc::clone(&count);
+            tokio::spawn(async move {
+                run_periodic(Duration::from_millis(50), move || {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .await;
+            })
+        };
+
+        // Before one full interval has elapsed, the action must not have
+        // fired — the helper deliberately skips the immediate first tick.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(count.load(Ordering::SeqCst), 0, "fired before first interval");
+
+        // After several intervals, expect at least two fires. Lenient
+        // bound to absorb scheduling jitter on slow runners.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        task.abort();
+        let n = count.load(Ordering::SeqCst);
+        assert!(n >= 2, "expected >= 2 fires, got {n}");
     }
 }
