@@ -109,6 +109,8 @@ async fn connect_once(
         match next {
             Ok(Some(Ok(Message::Text(text)))) => {
                 stats.messages.incr();
+                let now_ns = common::LocalTimestamp::now().as_nanos();
+                stats.last_msg.set_ns(now_ns);
                 if !got_any {
                     got_any = true;
                     *attempt = 0;

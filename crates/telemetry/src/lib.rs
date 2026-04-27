@@ -112,6 +112,37 @@ impl Counter {
 }
 
 // ---------------------------------------------------------------------------
+// AtomicTs
+// ---------------------------------------------------------------------------
+
+/// Shared atomic timestamp (nanoseconds since UNIX epoch). Cloning shares
+/// the underlying value, mirroring [`Counter`].
+///
+/// `set_ns` truncates its `u128` argument to `u64`, which is safe for any
+/// time we'll see in practice (`u64` ns covers 1970 → year ~2554). `0`
+/// is the "never set" sentinel — callers map it to `None` at the
+/// serialization boundary.
+///
+/// Uses `Relaxed` ordering: only eventual visibility is needed, no
+/// happens-before relationship to other memory.
+#[derive(Clone, Default, Debug)]
+pub struct AtomicTs(Arc<AtomicU64>);
+
+impl AtomicTs {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    pub fn set_ns(&self, ns: u128) {
+        self.0.store(ns as u64, Ordering::Relaxed);
+    }
+
+    pub fn get_ns(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 

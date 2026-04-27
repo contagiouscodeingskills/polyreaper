@@ -179,6 +179,8 @@ async fn connect_once(
         match next {
             Ok(Some(Ok(Message::Text(text)))) => {
                 stats.messages.incr();
+                let now_ns = common::LocalTimestamp::now().as_nanos();
+                stats.last_msg.set_ns(now_ns);
                 // First successful read proves the connection is useful —
                 // reset backoff so the next drop retries fast.
                 if !got_any_message {

@@ -29,7 +29,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use telemetry::Counter;
+use telemetry::{AtomicTs, Counter};
 
 /// Inputs the health writer needs from the rest of the recorder. Each
 /// `FeedStats` is cloned (cheap — `Counter` is `Arc<AtomicU64>`).
@@ -65,6 +65,12 @@ struct FeedCounters {
     reconnects: u64,
     parse_failures: u64,
     write_failures: u64,
+    /// Local wall-clock at the moment this feed last received a Text
+    /// frame off its websocket, ns since UNIX epoch. Stringified for
+    /// the same precision-preserving reason `Snapshot.ts_ns` is.
+    /// Omitted when the feed has never received a frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_msg_local_ts_ns: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -142,6 +148,7 @@ fn counters(s: &binance_feed::FeedStats) -> FeedCounters {
         reconnects: get(&s.reconnects),
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
+        last_msg_local_ts_ns: ts_field(&s.last_msg),
     }
 }
 fn counters_polymarket(s: &polymarket_feed::FeedStats) -> FeedCounters {
@@ -150,6 +157,7 @@ fn counters_polymarket(s: &polymarket_feed::FeedStats) -> FeedCounters {
         reconnects: get(&s.reconnects),
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
+        last_msg_local_ts_ns: ts_field(&s.last_msg),
     }
 }
 fn counters_coinbase(s: &coinbase_feed::FeedStats) -> FeedCounters {
@@ -158,6 +166,7 @@ fn counters_coinbase(s: &coinbase_feed::FeedStats) -> FeedCounters {
         reconnects: get(&s.reconnects),
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
+        last_msg_local_ts_ns: ts_field(&s.last_msg),
     }
 }
 fn counters_chainlink(s: &chainlink_feed::FeedStats) -> FeedCounters {
@@ -166,11 +175,24 @@ fn counters_chainlink(s: &chainlink_feed::FeedStats) -> FeedCounters {
         reconnects: get(&s.reconnects),
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
+        last_msg_local_ts_ns: ts_field(&s.last_msg),
     }
 }
 
 fn get(c: &Counter) -> u64 {
     c.get()
+}
+
+/// Format a feed's last-msg timestamp for the snapshot.
+/// `0` (never set) maps to `None`; otherwise stringified ns since
+/// UNIX epoch.
+fn ts_field(t: &AtomicTs) -> Option<String> {
+    let n = t.get_ns();
+    if n == 0 {
+        None
+    } else {
+        Some(n.to_string())
+    }
 }
 
 fn fetch_chrony() -> ChronyState {
@@ -309,10 +331,34 @@ Leap status     : Normal";
         let snap = Snapshot {
             ts_ns: "1234567890".into(),
             feeds: Feeds {
-                binance: FeedCounters { messages: 1, reconnects: 2, parse_failures: 3, write_failures: 4 },
-                polymarket: FeedCounters { messages: 0, reconnects: 0, parse_failures: 0, write_failures: 0 },
-                coinbase: FeedCounters { messages: 0, reconnects: 0, parse_failures: 0, write_failures: 0 },
-                chainlink: FeedCounters { messages: 0, reconnects: 0, parse_failures: 0, write_failures: 0 },
+                binance: FeedCounters {
+                    messages: 1,
+                    reconnects: 2,
+                    parse_failures: 3,
+                    write_failures: 4,
+                    last_msg_local_ts_ns: Some("9999".into()),
+                },
+                polymarket: FeedCounters {
+                    messages: 0,
+                    reconnects: 0,
+                    parse_failures: 0,
+                    write_failures: 0,
+                    last_msg_local_ts_ns: None,
+                },
+                coinbase: FeedCounters {
+                    messages: 0,
+                    reconnects: 0,
+                    parse_failures: 0,
+                    write_failures: 0,
+                    last_msg_local_ts_ns: None,
+                },
+                chainlink: FeedCounters {
+                    messages: 0,
+                    reconnects: 0,
+                    parse_failures: 0,
+                    write_failures: 0,
+                    last_msg_local_ts_ns: None,
+                },
             },
             chrony: ChronyState {
                 available: true,
@@ -328,7 +374,10 @@ Leap status     : Normal";
         assert!(line.contains(r#""ts_ns":"1234567890""#));
         assert!(line.contains(r#""last_offset_secs":0.001"#));
         assert!(line.contains(r#""available":true"#));
-        // Nullable error field omitted because we set Some only when present.
+        // Nullable fields omitted because we set Some only when present.
         assert!(!line.contains(r#""error":null"#));
+        // Binance has a last_msg; the others don't.
+        assert!(line.contains(r#""last_msg_local_ts_ns":"9999""#));
+        assert!(!line.contains(r#""last_msg_local_ts_ns":null"#));
     }
 }

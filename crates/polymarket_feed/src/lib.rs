@@ -25,7 +25,7 @@ mod frame;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use telemetry::Counter;
+use telemetry::{AtomicTs, Counter};
 
 pub const NAME: &str = "polymarket_feed";
 
@@ -43,6 +43,9 @@ pub struct FeedStats {
     /// Total tokens subscribed across all (re)connects. Rough indicator
     /// of subscription churn.
     pub subscriptions: Counter,
+    /// Local wall-clock at the moment this feed last received a Text
+    /// frame off its websocket — *not* a parsed event.
+    pub last_msg: AtomicTs,
 }
 
 impl FeedStats {

@@ -22,7 +22,7 @@ mod snapshot;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use telemetry::Counter;
+use telemetry::{AtomicTs, Counter};
 
 pub const NAME: &str = "binance_feed";
 
@@ -38,6 +38,11 @@ pub struct FeedStats {
     pub parse_failures: Counter,
     pub write_failures: Counter,
     pub reconnects: Counter,
+    /// Local wall-clock at the moment this feed last received a Text
+    /// frame off its websocket — *not* a parsed event. Read by the
+    /// recorder's health writer to detect silent feeds without
+    /// scanning data files.
+    pub last_msg: AtomicTs,
 }
 
 impl FeedStats {
