@@ -143,6 +143,83 @@ impl AtomicTs {
 }
 
 // ---------------------------------------------------------------------------
+// LatencyHistogram
+// ---------------------------------------------------------------------------
+
+const LATENCY_BUCKETS: usize = 20;
+
+/// Right-exclusive bucket boundaries in microseconds. Sample with value
+/// `v` lands in bucket `i` where `BOUNDARIES[i-1] <= v < BOUNDARIES[i]`
+/// (boundary 0 is implicitly 0). Anything `>= 1_000_000` lands in the
+/// overflow bucket at index `LATENCY_BUCKETS - 1`.
+const LATENCY_BOUNDARIES_US: [u64; 19] = [
+    1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
+    200_000, 500_000, 1_000_000,
+];
+
+/// Lock-free latency histogram with fixed 1/2/5×10ⁿ-µs buckets. Cloning
+/// shares the underlying counters, mirroring [`Counter`] / [`AtomicTs`].
+///
+/// **Cumulative since process start, NOT a rolling window.** Every
+/// `record_micros` call adds to a bucket counter that is never reset
+/// for the lifetime of the recorder process. After a recorder restart
+/// the histogram starts empty; the first hour or so of quantile
+/// readings will be biased by warm-up samples until enough later
+/// samples dominate the distribution. For the Phase 1 soak this is
+/// acceptable — a rolling reservoir would need a richer dep we are
+/// avoiding for now.
+///
+/// 19 boundary points cover 1 µs → 1 s in 1/2/5×10ⁿ steps; a 20th
+/// "overflow" bucket catches anything `>= 1 s`. Memory: 20 × 8 = 160 B
+/// per histogram. Quantile is conservative (returns the bucket *upper*
+/// bound) — `quantile_micros(0.99)` returning 1000 means the real p99
+/// lies in [500, 1000) µs, never above 1000 µs.
+#[derive(Clone, Default, Debug)]
+pub struct LatencyHistogram(Arc<[AtomicU64; LATENCY_BUCKETS]>);
+
+impl LatencyHistogram {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one observation. Samples `>= 1 s` land in the overflow
+    /// bucket and round-trip through [`Self::quantile_micros`] as
+    /// `u64::MAX` — an alarm sentinel.
+    pub fn record_micros(&self, us: u64) {
+        let idx = LATENCY_BOUNDARIES_US
+            .iter()
+            .position(|&b| us < b)
+            .unwrap_or(LATENCY_BUCKETS - 1);
+        self.0[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the upper bound of the bucket containing the p-th
+    /// sample (`p` in [0.0, 1.0]). Conservative — never under-reports.
+    /// `None` if no samples have been recorded yet.
+    pub fn quantile_micros(&self, p: f64) -> Option<u64> {
+        let counts: [u64; LATENCY_BUCKETS] =
+            std::array::from_fn(|i| self.0[i].load(Ordering::Relaxed));
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let target = ((total as f64) * p).ceil() as u64;
+        let mut cum = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            cum += c;
+            if cum >= target {
+                return Some(if i < LATENCY_BOUNDARIES_US.len() {
+                    LATENCY_BOUNDARIES_US[i]
+                } else {
+                    u64::MAX
+                });
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -193,5 +270,28 @@ mod tests {
         };
         let err = init(&cfg).unwrap_err();
         assert!(matches!(err, TelemetryError::BadFilter { .. }));
+    }
+
+    #[test]
+    fn latency_histogram_records_and_quantiles() {
+        let h = LatencyHistogram::new();
+        // Empty histogram → no quantile.
+        assert_eq!(h.quantile_micros(0.50), None);
+        // 99 samples in [50, 100) bucket → upper bound 100.
+        for _ in 0..99 {
+            h.record_micros(50);
+        }
+        // 1 sample in [5_000, 10_000) bucket → upper bound 10_000.
+        h.record_micros(5_000);
+        assert_eq!(h.quantile_micros(0.50), Some(100));
+        assert_eq!(h.quantile_micros(0.99), Some(100));
+        assert_eq!(h.quantile_micros(1.0), Some(10_000));
+    }
+
+    #[test]
+    fn latency_histogram_overflow_bucket() {
+        let h = LatencyHistogram::new();
+        h.record_micros(2_000_000); // >= 1 s → overflow bucket
+        assert_eq!(h.quantile_micros(1.0), Some(u64::MAX));
     }
 }

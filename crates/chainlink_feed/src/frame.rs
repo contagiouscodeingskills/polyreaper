@@ -53,20 +53,25 @@ pub(crate) fn process_text(
         payload: payload.to_string(),
     };
 
-    let mut guard = match store.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    if let Err(e) = guard.write(&event) {
-        stats.write_failures.incr();
-        tracing::error!(
-            component = "chainlink_feed",
-            venue = "chainlink",
-            event = "write_failure",
-            reason = %e,
-            "storage write failed"
-        );
+    let store_t0 = std::time::Instant::now();
+    {
+        let mut guard = match store.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Err(e) = guard.write(&event) {
+            stats.write_failures.incr();
+            tracing::error!(
+                component = "chainlink_feed",
+                venue = "chainlink",
+                event = "write_failure",
+                reason = %e,
+                "storage write failed"
+            );
+        }
     }
+    let store_us = store_t0.elapsed().as_micros() as u64;
+    stats.store_us.record_micros(store_us);
 }
 
 fn classify(payload: &str) -> Option<String> {

@@ -71,6 +71,19 @@ struct FeedCounters {
     /// Omitted when the feed has never received a frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_msg_local_ts_ns: Option<String>,
+    /// Storage critical-section duration quantiles, in microseconds.
+    /// Each sample is one (`store.lock()` + `guard.write()` + drop)
+    /// cycle. Cumulative since recorder start — *not* a rolling
+    /// window — so warm-up samples after a restart linger in the
+    /// distribution. Omitted until the feed records its first sample.
+    /// Acceptance: p99 < 1000 healthy, > 10000 sustained → discuss
+    /// per-feed storage writers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_p50_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_p99_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_p999_us: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -149,6 +162,9 @@ fn counters(s: &binance_feed::FeedStats) -> FeedCounters {
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
         last_msg_local_ts_ns: ts_field(&s.last_msg),
+        store_p50_us: s.store_us.quantile_micros(0.50),
+        store_p99_us: s.store_us.quantile_micros(0.99),
+        store_p999_us: s.store_us.quantile_micros(0.999),
     }
 }
 fn counters_polymarket(s: &polymarket_feed::FeedStats) -> FeedCounters {
@@ -158,6 +174,9 @@ fn counters_polymarket(s: &polymarket_feed::FeedStats) -> FeedCounters {
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
         last_msg_local_ts_ns: ts_field(&s.last_msg),
+        store_p50_us: s.store_us.quantile_micros(0.50),
+        store_p99_us: s.store_us.quantile_micros(0.99),
+        store_p999_us: s.store_us.quantile_micros(0.999),
     }
 }
 fn counters_coinbase(s: &coinbase_feed::FeedStats) -> FeedCounters {
@@ -167,6 +186,9 @@ fn counters_coinbase(s: &coinbase_feed::FeedStats) -> FeedCounters {
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
         last_msg_local_ts_ns: ts_field(&s.last_msg),
+        store_p50_us: s.store_us.quantile_micros(0.50),
+        store_p99_us: s.store_us.quantile_micros(0.99),
+        store_p999_us: s.store_us.quantile_micros(0.999),
     }
 }
 fn counters_chainlink(s: &chainlink_feed::FeedStats) -> FeedCounters {
@@ -176,6 +198,9 @@ fn counters_chainlink(s: &chainlink_feed::FeedStats) -> FeedCounters {
         parse_failures: get(&s.parse_failures),
         write_failures: get(&s.write_failures),
         last_msg_local_ts_ns: ts_field(&s.last_msg),
+        store_p50_us: s.store_us.quantile_micros(0.50),
+        store_p99_us: s.store_us.quantile_micros(0.99),
+        store_p999_us: s.store_us.quantile_micros(0.999),
     }
 }
 
@@ -337,6 +362,9 @@ Leap status     : Normal";
                     parse_failures: 3,
                     write_failures: 4,
                     last_msg_local_ts_ns: Some("9999".into()),
+                    store_p50_us: Some(123),
+                    store_p99_us: Some(456),
+                    store_p999_us: Some(789),
                 },
                 polymarket: FeedCounters {
                     messages: 0,
@@ -344,6 +372,9 @@ Leap status     : Normal";
                     parse_failures: 0,
                     write_failures: 0,
                     last_msg_local_ts_ns: None,
+                    store_p50_us: None,
+                    store_p99_us: None,
+                    store_p999_us: None,
                 },
                 coinbase: FeedCounters {
                     messages: 0,
@@ -351,6 +382,9 @@ Leap status     : Normal";
                     parse_failures: 0,
                     write_failures: 0,
                     last_msg_local_ts_ns: None,
+                    store_p50_us: None,
+                    store_p99_us: None,
+                    store_p999_us: None,
                 },
                 chainlink: FeedCounters {
                     messages: 0,
@@ -358,6 +392,9 @@ Leap status     : Normal";
                     parse_failures: 0,
                     write_failures: 0,
                     last_msg_local_ts_ns: None,
+                    store_p50_us: None,
+                    store_p99_us: None,
+                    store_p999_us: None,
                 },
             },
             chrony: ChronyState {
@@ -379,5 +416,8 @@ Leap status     : Normal";
         // Binance has a last_msg; the others don't.
         assert!(line.contains(r#""last_msg_local_ts_ns":"9999""#));
         assert!(!line.contains(r#""last_msg_local_ts_ns":null"#));
+        // Binance has store latency quantiles; the others don't.
+        assert!(line.contains(r#""store_p99_us":456"#));
+        assert!(!line.contains(r#""store_p99_us":null"#));
     }
 }

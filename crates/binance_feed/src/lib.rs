@@ -22,7 +22,7 @@ mod snapshot;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use telemetry::{AtomicTs, Counter};
+use telemetry::{AtomicTs, Counter, LatencyHistogram};
 
 pub const NAME: &str = "binance_feed";
 
@@ -43,6 +43,11 @@ pub struct FeedStats {
     /// recorder's health writer to detect silent feeds without
     /// scanning data files.
     pub last_msg: AtomicTs,
+    /// Cumulative-since-process-start histogram of storage critical-
+    /// section durations (Mutex acquire + write + guard drop), in
+    /// microseconds. Surfaced as `store_p50_us` / `store_p99_us` etc.
+    /// in `_health.ndjson` for early warning of storage contention.
+    pub store_us: LatencyHistogram,
 }
 
 impl FeedStats {

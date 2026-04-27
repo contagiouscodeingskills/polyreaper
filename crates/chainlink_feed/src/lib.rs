@@ -26,7 +26,7 @@ mod frame;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use telemetry::{AtomicTs, Counter};
+use telemetry::{AtomicTs, Counter, LatencyHistogram};
 
 pub const NAME: &str = "chainlink_feed";
 
@@ -41,6 +41,10 @@ pub struct FeedStats {
     /// Local wall-clock at the moment this feed last received a Text
     /// frame off its websocket — *not* a parsed event.
     pub last_msg: AtomicTs,
+    /// Cumulative-since-process-start histogram of storage critical-
+    /// section durations (Mutex acquire + write + guard drop), in
+    /// microseconds.
+    pub store_us: LatencyHistogram,
 }
 
 impl FeedStats {

@@ -54,28 +54,33 @@ pub(crate) fn process_text(
         payload: payload.to_string(),
     };
 
-    let mut guard = match store.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
+    let store_t0 = std::time::Instant::now();
+    {
+        let mut guard = match store.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::error!(
+                    component = "binance_feed",
+                    venue = "binance",
+                    event = "store_poisoned",
+                    "recovering poisoned store mutex"
+                );
+                poisoned.into_inner()
+            }
+        };
+        if let Err(e) = guard.write(&event) {
+            stats.write_failures.incr();
             tracing::error!(
                 component = "binance_feed",
                 venue = "binance",
-                event = "store_poisoned",
-                "recovering poisoned store mutex"
+                event = "write_failure",
+                reason = %e,
+                "storage write failed"
             );
-            poisoned.into_inner()
         }
-    };
-    if let Err(e) = guard.write(&event) {
-        stats.write_failures.incr();
-        tracing::error!(
-            component = "binance_feed",
-            venue = "binance",
-            event = "write_failure",
-            reason = %e,
-            "storage write failed"
-        );
     }
+    let store_us = store_t0.elapsed().as_micros() as u64;
+    stats.store_us.record_micros(store_us);
 }
 
 /// What we pull out of a Binance stream frame. Owning so the `RawEvent`
