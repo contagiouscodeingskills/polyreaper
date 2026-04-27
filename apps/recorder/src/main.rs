@@ -252,18 +252,21 @@ async fn main() -> ExitCode {
         "coinbase feed task spawned"
     );
 
+    // Chainlink on-chain feed disabled — produced 0 useful events in a
+    // 13 h soak with 380 reconnects from publicnode.com idle timeouts,
+    // and AggregatorV3 is the wrong oracle for 5-minute markets anyway
+    // (Polymarket settles on Chainlink Data Streams). Re-enable once the
+    // Data Streams integration lands. The stats struct and handle are
+    // kept as no-ops so HealthInputs and shutdown ordering need no
+    // changes; _health.ndjson will report all-zero chainlink counters.
     let chainlink_stats = chainlink_feed::FeedStats::new();
-    let chainlink_cfg = cfg.chainlink_feed.clone();
-    let chainlink_store = Arc::clone(&store);
-    let chainlink_stats_for_feed = chainlink_stats.clone();
-    let chainlink_handle = tokio::spawn(async move {
-        chainlink_feed::run(&chainlink_cfg, chainlink_store, chainlink_stats_for_feed).await
-    });
+    let chainlink_handle = tokio::spawn(async {});
     tracing::info!(
         component = "recorder",
-        event = "feed_spawned",
+        event = "feed_disabled",
         venue = "chainlink",
-        "chainlink feed task spawned"
+        reason = "low signal + reconnect storm; awaiting Data Streams",
+        "chainlink feed disabled"
     );
 
     // Health snapshot writer — appends to <session>/_health.ndjson every
