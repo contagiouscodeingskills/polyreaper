@@ -34,6 +34,11 @@ pub enum Command {
         filter: ReplayFilter,
         out: PathBuf,
     },
+    Integrity {
+        root: PathBuf,
+        verbose: bool,
+        json: bool,
+    },
     Schema,
 }
 
@@ -57,12 +62,13 @@ USAGE:
     replayer <COMMAND> [OPTIONS]
 
 COMMANDS:
-    sessions   List sessions under --root
-    count      Count events matching the filter
-    head       Print the first -n events as NDJSON
-    tail       Print the last -n events as NDJSON
-    dump       Write filtered events to a Parquet file at --out
-    schema     Print the Parquet export schema
+    sessions    List sessions under --root
+    count       Count events matching the filter
+    head        Print the first -n events as NDJSON
+    tail        Print the last -n events as NDJSON
+    dump        Write filtered events to a Parquet file at --out
+    integrity   Check captured session(s) for data quality problems
+    schema      Print the Parquet export schema
 
 OPTIONS:
     --root <PATH>          Session dir or base dir containing session_<UTC>/...
@@ -73,12 +79,16 @@ OPTIONS:
     --from <NS>            Inclusive lower bound on local_ts_ns.
     --to <NS>              Exclusive upper bound on local_ts_ns.
     -n <N>                 Number of events for head/tail (default 10).
+    --verbose              integrity: include per-file findings in output.
+    --json                 integrity: emit NDJSON instead of human-readable text.
 
 EXAMPLES:
-    replayer sessions --root ./data
-    replayer count    --root ./data --venue binance
-    replayer head     --root ./data/session_20260425T053013Z --stream-prefix btcusdt@ -n 3
-    replayer dump     --root ./data --venue coinbase --out /tmp/cb.parquet
+    replayer sessions   --root ./data
+    replayer count      --root ./data --venue binance
+    replayer head       --root ./data/session_20260425T053013Z --stream-prefix btcusdt@ -n 3
+    replayer dump       --root ./data --venue coinbase --out /tmp/cb.parquet
+    replayer integrity  --root ./data/session_20260425T053013Z
+    replayer integrity  --root ./data --json
     replayer schema
 ";
 
@@ -120,6 +130,11 @@ pub fn parse() -> Result<Command, CliError> {
                 filter: opts.into_filter()?,
             })
         }
+        "integrity" => Ok(Command::Integrity {
+            root: opts.require_root()?,
+            verbose: opts.verbose,
+            json: opts.json,
+        }),
         "schema" => Ok(Command::Schema),
         "--help" | "-h" | "help" => {
             Err(CliError::Usage(USAGE.to_string()))
@@ -140,6 +155,8 @@ struct Opts {
     from: Option<u128>,
     to: Option<u128>,
     n: Option<usize>,
+    verbose: bool,
+    json: bool,
 }
 
 impl Opts {
@@ -188,6 +205,14 @@ impl Opts {
                         .map_err(|_| CliError::Usage(format!("-n needs a positive integer\n\n{USAGE}")))?;
                     o.n = Some(n);
                     i += 2;
+                }
+                "--verbose" => {
+                    o.verbose = true;
+                    i += 1;
+                }
+                "--json" => {
+                    o.json = true;
+                    i += 1;
                 }
                 "--help" | "-h" => {
                     return Err(CliError::Usage(USAGE.to_string()));

@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::process::ExitCode;
 
+use replayer::integrity::{check_session, FindingKind, SessionIntegrity};
 use replayer::{open_base_dir, open_session, ReplayError, ReplayFilter, SessionDir};
 
 use crate::cli::{Command, CliError};
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         Command::Head { root, filter, n } => run_head(&root, filter, n),
         Command::Tail { root, filter, n } => run_tail(&root, filter, n),
         Command::Dump { root, filter, out } => run_dump(&root, filter, &out),
+        Command::Integrity { root, verbose, json } => run_integrity(&root, verbose, json),
         Command::Schema => run_schema(),
     };
 
@@ -142,4 +144,116 @@ fn run_schema() -> Result<(), ReplayError> {
     // this into a doc / commit message rather than parse it.
     println!("{}", s);
     Ok(())
+}
+
+fn run_integrity(root: &Path, verbose: bool, json: bool) -> Result<(), ReplayError> {
+    // Single session dir → check it. Otherwise treat as base dir and
+    // emit one summary per discovered session, in chronological order.
+    let sessions: Vec<SessionDir> = match SessionDir::from_path(root) {
+        Ok(sd) => vec![sd],
+        Err(_) => SessionDir::discover(root)?,
+    };
+
+    for (i, sd) in sessions.iter().enumerate() {
+        let report = check_session(sd, verbose)?;
+        if json {
+            let line = serde_json::to_string(&report).expect("integrity report serialises");
+            println!("{line}");
+        } else {
+            if i > 0 {
+                println!();
+            }
+            print_text_report(&report);
+        }
+    }
+    Ok(())
+}
+
+fn print_text_report(r: &SessionIntegrity) {
+    println!("{}", r.session_name);
+    println!("{}", "=".repeat(r.session_name.len()));
+    println!(
+        "scanned {} files, {} events in {:.1}s",
+        r.files_scanned, r.total_events, r.elapsed_secs
+    );
+    println!();
+
+    println!("per-venue");
+    for (venue, stats) in &r.per_venue {
+        println!(
+            "  {:<12} {:>6} streams   {:>12} events",
+            venue, stats.streams, stats.events
+        );
+    }
+    println!();
+
+    println!("structural");
+    println!("  empty files                       {}", r.structural.empty_files);
+    println!(
+        "  resolution-sweeper 0-byte files   {}",
+        r.structural.resolution_zero_byte_files
+    );
+    println!("  _unrouted files                   {}", r.structural.unrouted_files);
+    println!(
+        "  _unknown_market-* files           {}",
+        r.structural.unknown_market_files
+    );
+    println!(
+        "  _unknown_token-* files            {}",
+        r.structural.unknown_token_files
+    );
+    println!("  bucket gaps                       {}", r.structural.bucket_gaps);
+    println!("  parse errors                      {}", r.structural.parse_errors);
+    println!("  ts violations (per file)          {}", r.structural.ts_violations);
+    println!();
+
+    println!("decoder");
+    println!("  decode errors                     {}", r.decoder.decode_errors);
+    println!(
+        "  Unknown variants                  {}  (informational; subscription acks etc. expected)",
+        r.decoder.unknown_variants
+    );
+    println!();
+
+    println!("sequence integrity");
+    println!(
+        "  Binance depth chain breaks        {}",
+        r.sequence.binance_depth_chain_breaks
+    );
+    println!(
+        "  Binance depth snapshots observed  {}  (each snapshot resets the chain;",
+        r.sequence.binance_depth_snapshots_observed
+    );
+    println!("                                       breaks <= snapshots → expected reconnect/refresh,");
+    println!("                                       breaks  > snapshots → real packet loss)");
+
+    if !r.details.is_empty() {
+        println!();
+        println!("details");
+        for f in &r.details {
+            let kind = match f.kind {
+                FindingKind::EmptyFile => "EmptyFile",
+                FindingKind::ResolutionZeroByte => "ResolutionZeroByte",
+                FindingKind::UnroutedFile => "UnroutedFile",
+                FindingKind::UnknownMarketFile => "UnknownMarketFile",
+                FindingKind::UnknownTokenFile => "UnknownTokenFile",
+                FindingKind::BucketGap => "BucketGap",
+                FindingKind::ParseError => "ParseError",
+                FindingKind::TsViolation => "TsViolation",
+                FindingKind::DecodeError => "DecodeError",
+                FindingKind::BinanceDepthChainBreak => "BinanceDepthChainBreak",
+            };
+            if f.note.is_empty() {
+                println!("  {} — {} ({})", f.path.display(), kind, f.count);
+            } else {
+                println!(
+                    "  {} — {} ({}, {})",
+                    f.path.display(),
+                    kind,
+                    f.count,
+                    f.note
+                );
+            }
+        }
+    }
 }

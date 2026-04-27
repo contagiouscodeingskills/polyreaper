@@ -34,6 +34,7 @@ pub mod decode;
 pub mod discovery;
 pub mod error;
 pub mod filter;
+pub mod integrity;
 pub mod merge;
 pub mod pacer;
 #[cfg(feature = "parquet")]

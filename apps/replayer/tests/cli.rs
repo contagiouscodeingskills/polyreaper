@@ -247,3 +247,50 @@ fn missing_root_exits_with_code_2() {
         .expect("spawn replayer");
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn integrity_text_runs_and_prints_sections() {
+    let (_tmp, session) = fixture();
+    let out = Command::new(replayer_bin())
+        .args(["integrity", "--root"])
+        .arg(&session)
+        .output()
+        .expect("spawn replayer");
+    assert!(
+        out.status.success(),
+        "exit {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for section in [
+        "scanned",
+        "per-venue",
+        "structural",
+        "decoder",
+        "sequence integrity",
+        "Binance depth chain breaks",
+    ] {
+        assert!(stdout.contains(section), "missing {section:?}:\n{stdout}");
+    }
+}
+
+#[test]
+fn integrity_json_emits_one_object_per_session() {
+    let (_tmp, session) = fixture();
+    let out = Command::new(replayer_bin())
+        .args(["integrity"])
+        .arg("--root")
+        .arg(&session)
+        .arg("--json")
+        .output()
+        .expect("spawn replayer");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let trimmed = stdout.trim();
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).expect("valid JSON");
+    assert!(parsed.get("session_name").is_some(), "missing session_name: {trimmed}");
+    assert!(parsed.get("structural").is_some());
+    assert!(parsed.get("decoder").is_some());
+    assert!(parsed.get("sequence").is_some());
+}
