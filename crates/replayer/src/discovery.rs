@@ -33,6 +33,10 @@ pub struct FileBucket {
     /// Bucket index. `0` for non-rotated files (no `.NNNN` suffix).
     pub bucket: u64,
     pub path: PathBuf,
+    /// True for `*.ndjson.gz`. Set so the reader can wrap with GzDecoder
+    /// without re-inspecting the path. Sessions compressed by `disk_guard.sh`
+    /// have this set; in-flight sessions don't.
+    pub compressed: bool,
 }
 
 impl SessionDir {
@@ -144,12 +148,21 @@ fn parse_venue(name: &str) -> Option<Venue> {
     }
 }
 
-/// Parse `<stream>.ndjson` or `<stream>.NNNN.ndjson`. Stream names from
-/// the recorder go through `sanitize_stream_name` which keeps `[a-zA-Z0-9_-]`
-/// — so `.` only appears as the bucket separator.
+/// Parse `<stream>.ndjson`, `<stream>.NNNN.ndjson`, or the gzip-compressed
+/// variants `<stream>.ndjson.gz` / `<stream>.NNNN.ndjson.gz`. Stream names
+/// from the recorder go through `sanitize_stream_name` which keeps
+/// `[a-zA-Z0-9_-]` — so `.` only appears as the bucket separator or the
+/// `.ndjson(.gz)?` extension.
 fn parse_file_name(venue: Venue, path: &Path) -> Option<FileBucket> {
     let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".ndjson")?;
+    // Strip `.gz` first so the rest of the parser is identical for plain
+    // and compressed files. Sessions become `.gz` once disk_guard rolls
+    // over them.
+    let (extless, compressed) = match name.strip_suffix(".gz") {
+        Some(rest) => (rest, true),
+        None => (name, false),
+    };
+    let stem = extless.strip_suffix(".ndjson")?;
     if let Some(dot_idx) = stem.rfind('.') {
         let (left, right) = (&stem[..dot_idx], &stem[dot_idx + 1..]);
         if right.len() == 4 && right.chars().all(|c| c.is_ascii_digit()) {
@@ -159,6 +172,7 @@ fn parse_file_name(venue: Venue, path: &Path) -> Option<FileBucket> {
                     stream: left.to_string(),
                     bucket,
                     path: path.to_path_buf(),
+                    compressed,
                 });
             }
         }
@@ -168,6 +182,7 @@ fn parse_file_name(venue: Venue, path: &Path) -> Option<FileBucket> {
         stream: stem.to_string(),
         bucket: 0,
         path: path.to_path_buf(),
+        compressed,
     })
 }
 
@@ -181,6 +196,7 @@ mod tests {
         let f = parse_file_name(Venue::Binance, &p).unwrap();
         assert_eq!(f.stream, "btcusdt_trade");
         assert_eq!(f.bucket, 7);
+        assert!(!f.compressed);
     }
 
     #[test]
@@ -189,6 +205,25 @@ mod tests {
         let f = parse_file_name(Venue::Binance, &p).unwrap();
         assert_eq!(f.stream, "btcusdt_trade");
         assert_eq!(f.bucket, 0);
+        assert!(!f.compressed);
+    }
+
+    #[test]
+    fn parses_gzipped_rotated_filename() {
+        let p = PathBuf::from("/tmp/session/binance/btcusdt_trade.0007.ndjson.gz");
+        let f = parse_file_name(Venue::Binance, &p).unwrap();
+        assert_eq!(f.stream, "btcusdt_trade");
+        assert_eq!(f.bucket, 7);
+        assert!(f.compressed);
+    }
+
+    #[test]
+    fn parses_gzipped_non_rotated_filename() {
+        let p = PathBuf::from("/tmp/session/binance/btcusdt_trade.ndjson.gz");
+        let f = parse_file_name(Venue::Binance, &p).unwrap();
+        assert_eq!(f.stream, "btcusdt_trade");
+        assert_eq!(f.bucket, 0);
+        assert!(f.compressed);
     }
 
     #[test]

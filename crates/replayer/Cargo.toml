@@ -17,6 +17,7 @@ serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
 rust_decimal = { workspace = true }
+flate2       = { workspace = true }
 arrow        = { workspace = true, optional = true }
 parquet      = { workspace = true, optional = true }
 

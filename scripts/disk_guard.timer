@@ -1,0 +1,14 @@
+[Unit]
+Description=Run polybot disk_guard every 5 minutes
+Requires=disk_guard.service
+
+[Timer]
+# First run 2 minutes after boot, then every 5 minutes after the previous
+# run *finished*. We use OnUnitActiveSec rather than OnCalendar so a slow
+# disk_guard run can't trigger an overlapping run.
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=disk_guard.service
+
+[Install]
+WantedBy=timers.target

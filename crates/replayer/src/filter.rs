@@ -128,6 +128,7 @@ mod tests {
             stream: stream.into(),
             bucket: 0,
             path: PathBuf::from("/dev/null"),
+            compressed: false,
         }
     }
 
