@@ -217,6 +217,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(ts_ns),
             venue_ts_ms: None,
             payload: String::new(),
+        ..Default::default()
         }
     }
 

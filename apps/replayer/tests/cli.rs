@@ -60,6 +60,7 @@ fn ev(venue: Venue, stream: &str, ts: u128, payload: &str) -> RawEvent {
         local_ts_ns: LocalTimestamp::from_nanos(ts),
         venue_ts_ms: None,
         payload: payload.into(),
+    ..Default::default()
     }
 }
 

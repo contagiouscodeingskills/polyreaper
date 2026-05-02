@@ -37,6 +37,7 @@
 //! Unrecognised events go to `_unrouted` / `_unknown_market-<id>` /
 //! `_unknown_token-<id>` so nothing is silently dropped.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{LocalTimestamp, RawEvent, Venue};
@@ -47,6 +48,13 @@ use crate::FeedStats;
 
 const RAW_LOG_TRUNCATE: usize = 256;
 
+/// Per-process monotonic counter for Polymarket WS frames. Each call to
+/// [`process_text`] consumes exactly one id; events demuxed from one
+/// frame share that id, with `event_index_in_batch` set to their
+/// position within the array. Resets on recorder restart — uniqueness
+/// is per-session, which is what replay needs.
+static WIRE_BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn process_text(
     payload: &str,
     registry: &Arc<Mutex<Registry>>,
@@ -54,12 +62,15 @@ pub(crate) fn process_text(
     stats: &FeedStats,
 ) {
     let local_ts = LocalTimestamp::now();
+    let wire_batch_id = WIRE_BATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     let parsed: Result<Value, _> = serde_json::from_str(payload);
     match parsed {
         Ok(Value::Array(arr)) if !arr.is_empty() => {
-            // Demux: each array element becomes its own RawEvent.
-            for item in &arr {
+            // Demux: each array element becomes its own RawEvent. They
+            // share `wire_batch_id` so replay can group them; their
+            // `event_index_in_batch` is their array position.
+            for (idx, item) in arr.iter().enumerate() {
                 let item_payload = match serde_json::to_string(item) {
                     Ok(s) => s,
                     Err(_) => {
@@ -70,13 +81,29 @@ pub(crate) fn process_text(
                     }
                 };
                 let stream = stream_for_value(item, registry, stats);
-                write_one(local_ts, stream, item_payload, store, stats);
+                write_one(
+                    local_ts,
+                    stream,
+                    item_payload,
+                    wire_batch_id,
+                    idx as u32,
+                    store,
+                    stats,
+                );
             }
         }
         Ok(_) => {
-            // Single object (or scalar/null) — route as-is.
+            // Single object (or scalar/null) — one event in this frame.
             let stream = stream_for_payload(payload, registry, stats);
-            write_one(local_ts, stream, payload.to_string(), store, stats);
+            write_one(
+                local_ts,
+                stream,
+                payload.to_string(),
+                wire_batch_id,
+                0,
+                store,
+                stats,
+            );
         }
         Err(_) => {
             stats.parse_failures.incr();
@@ -92,6 +119,8 @@ pub(crate) fn process_text(
                 local_ts,
                 "_unrouted".to_string(),
                 payload.to_string(),
+                wire_batch_id,
+                0,
                 store,
                 stats,
             );
@@ -215,10 +244,13 @@ fn stream_for(market: &market_registry::Market) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_one(
     local_ts: LocalTimestamp,
     stream: String,
     payload: String,
+    wire_batch_id: u64,
+    event_index_in_batch: u32,
     store: &Arc<Mutex<storage::Store>>,
     stats: &FeedStats,
 ) {
@@ -228,6 +260,8 @@ fn write_one(
         local_ts_ns: local_ts,
         venue_ts_ms: None, // Polymarket events don't carry a uniform ts field
         payload,
+        wire_batch_id: Some(wire_batch_id),
+        event_index_in_batch: Some(event_index_in_batch),
     };
     let store_t0 = std::time::Instant::now();
     {
@@ -366,5 +400,119 @@ mod tests {
         let mut m = market("", "0xC", "Y", "N");
         m.slug = String::new();
         assert_eq!(stream_for(&m), "0xC");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 5: wire_batch_id + event_index_in_batch
+    // -----------------------------------------------------------------
+
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let ptr = &nanos as *const _ as usize;
+            let dir = std::env::temp_dir()
+                .join(format!("polybot_pmf_test_{nanos}_{ptr:x}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_store(tmp: &Path) -> Arc<Mutex<storage::Store>> {
+        let cfg = config::StorageConfig {
+            base_dir: tmp.to_path_buf(),
+            rotate_minutes: 0,
+            fsync_on_write: false,
+        };
+        Arc::new(Mutex::new(storage::Store::open(&cfg).unwrap()))
+    }
+
+    fn read_back(store: &Arc<Mutex<storage::Store>>, file_name: &str) -> Vec<common::RawEvent> {
+        let session = store.lock().unwrap().session_dir().to_path_buf();
+        let path = session.join("polymarket").join(file_name);
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        body.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<common::RawEvent>(l).unwrap())
+            .collect()
+    }
+
+    /// One single-object frame should produce one RawEvent with
+    /// event_index_in_batch == 0.
+    #[test]
+    fn single_object_frame_gets_index_zero() {
+        let tmp = TestDir::new();
+        let store = make_store(tmp.path());
+        let registry = registry_with(vec![market("slug-A", "0xA", "Y", "N")]);
+        let stats = crate::FeedStats::new();
+
+        // One single-object frame.
+        process_text(r#"{"market":"0xA"}"#, &registry, &store, &stats);
+
+        // Drop the store to flush BufWriters; reopen for reading.
+        store.lock().unwrap().flush_all().unwrap();
+        let events = read_back(&store, "slug-A.ndjson");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_index_in_batch, Some(0));
+        assert!(events[0].wire_batch_id.is_some());
+    }
+
+    /// One array frame with N elements should produce N RawEvents that
+    /// share the same wire_batch_id but have indices 0..N-1.
+    #[test]
+    fn array_frame_shares_batch_id_with_distinct_indices() {
+        let tmp = TestDir::new();
+        let store = make_store(tmp.path());
+        let registry = registry_with(vec![market("slug-A", "0xA", "Y", "N")]);
+        let stats = crate::FeedStats::new();
+
+        // Three-element array, all routing to the same market.
+        let frame = r#"[{"market":"0xA"},{"market":"0xA"},{"market":"0xA"}]"#;
+        process_text(frame, &registry, &store, &stats);
+
+        store.lock().unwrap().flush_all().unwrap();
+        let events = read_back(&store, "slug-A.ndjson");
+        assert_eq!(events.len(), 3);
+        let batch_id = events[0].wire_batch_id.expect("batch id present");
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(e.wire_batch_id, Some(batch_id), "all share the same batch id");
+            assert_eq!(e.event_index_in_batch, Some(i as u32));
+        }
+    }
+
+    /// Two consecutive frames must have *different* wire_batch_ids.
+    #[test]
+    fn distinct_frames_get_distinct_batch_ids() {
+        let tmp = TestDir::new();
+        let store = make_store(tmp.path());
+        let registry = registry_with(vec![market("slug-A", "0xA", "Y", "N")]);
+        let stats = crate::FeedStats::new();
+
+        process_text(r#"{"market":"0xA"}"#, &registry, &store, &stats);
+        process_text(r#"{"market":"0xA"}"#, &registry, &store, &stats);
+
+        store.lock().unwrap().flush_all().unwrap();
+        let events = read_back(&store, "slug-A.ndjson");
+        assert_eq!(events.len(), 2);
+        let id0 = events[0].wire_batch_id.unwrap();
+        let id1 = events[1].wire_batch_id.unwrap();
+        assert_ne!(id0, id1, "successive frames get distinct batch ids");
+        // Both events are the only event in their frame.
+        assert_eq!(events[0].event_index_in_batch, Some(0));
+        assert_eq!(events[1].event_index_in_batch, Some(0));
     }
 }

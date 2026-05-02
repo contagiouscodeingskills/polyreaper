@@ -145,6 +145,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(ns),
             venue_ts_ms: None,
             payload: payload.into(),
+        ..Default::default()
         }
     }
 

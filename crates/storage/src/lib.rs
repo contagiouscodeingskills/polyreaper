@@ -416,6 +416,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(ns),
             venue_ts_ms: venue_ts,
             payload: payload.into(),
+        ..Default::default()
         }
     }
 
@@ -564,6 +565,7 @@ mod tests {
                 local_ts_ns: LocalTimestamp::from_nanos(9_007_199_254_740_993),
                 venue_ts_ms: Some(1_776_900_000_000),
                 payload: r#"{"e":"trade","s":"BTCUSDT","p":"45000.12"}"#.into(),
+                ..Default::default()
             },
             RawEvent {
                 venue: Venue::Polymarket,
@@ -571,6 +573,7 @@ mod tests {
                 local_ts_ns: LocalTimestamp::from_nanos(1),
                 venue_ts_ms: None,
                 payload: "pm payload with \"quotes\" and \\ backslash".into(),
+                ..Default::default()
             },
         ];
 

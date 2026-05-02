@@ -52,6 +52,9 @@ pub(crate) fn process_text(
         local_ts_ns: local_ts,
         venue_ts_ms,
         payload: payload.to_string(),
+        // Binance frames are 1:1 with events (no demux), so wire_batch_id
+        // semantics don't apply.
+        ..Default::default()
     };
 
     let store_t0 = std::time::Instant::now();

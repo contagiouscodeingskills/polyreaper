@@ -54,7 +54,7 @@ impl Venue {
 /// consumer that parses JSON through an f64 (Python's `json` module,
 /// JavaScript, `jq`) would lose precision on a numeric encoding. A string
 /// preserves the value exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct LocalTimestamp(u128);
 
 impl LocalTimestamp {
@@ -145,7 +145,7 @@ impl<'de> Deserialize<'de> for LocalTimestamp {
 /// without lifetime juggling. The per-message allocations (one `String` for
 /// `stream`, one for `payload`) are deliberate — Phase 1 prioritises
 /// correctness and simplicity over allocator work.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RawEvent {
     pub venue: Venue,
 
@@ -166,6 +166,28 @@ pub struct RawEvent {
     /// Raw payload, exactly as received. UTF-8 text for Phase 1 (see
     /// `docs/TECH_DEBT.md` §2 for binary support).
     pub payload: String,
+
+    /// Per-WS-frame identifier for venues that demux a single wire frame
+    /// into multiple events (Polymarket array frames). Events with the
+    /// same `wire_batch_id` came from the same `ws.next()` call. Always
+    /// `None` for venues that don't demux. Populated for Polymarket
+    /// captures from recorder v0.1.0+ onwards; older captures have it
+    /// absent (handled via `serde(default)`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wire_batch_id: Option<u64>,
+
+    /// 0-based position of this event within its WS frame. `0` for
+    /// non-demuxed events; `0..n-1` for the n elements of a demuxed
+    /// array. Pairs with `wire_batch_id` to reconstruct the original
+    /// frame at replay time.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub event_index_in_batch: Option<u32>,
+}
+
+impl Default for Venue {
+    fn default() -> Self {
+        Venue::Binance
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +317,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(1_776_768_000_000_000_000),
             venue_ts_ms: Some(1_776_768_000_000),
             payload: r#"{"hello":"world"}"#.into(),
+            ..Default::default()
         };
         let line = serde_json::to_string(&event).unwrap();
         let parsed: RawEvent = serde_json::from_str(&line).unwrap();
@@ -309,9 +332,23 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(1),
             venue_ts_ms: None,
             payload: "x".into(),
+            ..Default::default()
         };
         let line = serde_json::to_string(&event).unwrap();
         assert!(!line.contains("venue_ts_ms"), "got {line}");
+    }
+
+    #[test]
+    fn raw_event_loads_legacy_pre_phase5_lines() {
+        // Lines captured before Phase 5 had no wire_batch_id /
+        // event_index_in_batch fields. Loading them must succeed with
+        // both new fields defaulting to None.
+        let legacy_line = r#"{"venue":"polymarket","stream":"x","local_ts_ns":"1","payload":"p"}"#;
+        let parsed: RawEvent = serde_json::from_str(legacy_line).unwrap();
+        assert_eq!(parsed.venue, Venue::Polymarket);
+        assert_eq!(parsed.local_ts_ns.as_nanos(), 1);
+        assert_eq!(parsed.wire_batch_id, None);
+        assert_eq!(parsed.event_index_in_batch, None);
     }
 
     #[test]
@@ -324,6 +361,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(1),
             venue_ts_ms: Some(42),
             payload: "p".into(),
+            ..Default::default()
         };
         let line = serde_json::to_string(&event).unwrap();
         assert_eq!(

@@ -815,6 +815,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(ts),
             venue_ts_ms: None,
             payload: payload.into(),
+            ..Default::default()
         };
         serde_json::to_string(&ev).unwrap()
     }
