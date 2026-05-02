@@ -371,6 +371,12 @@ fn print_text_report(r: &SessionIntegrity) {
     );
     println!();
 
+    println!("VERDICT: {}", r.verdict);
+    if !r.verdict_reason.is_empty() {
+        println!("  reason: {}", r.verdict_reason);
+    }
+    println!();
+
     println!("per-venue");
     for (venue, stats) in &r.per_venue {
         println!(
@@ -383,8 +389,16 @@ fn print_text_report(r: &SessionIntegrity) {
     println!("structural");
     println!("  empty files                       {}", r.structural.empty_files);
     println!(
-        "  resolution-sweeper 0-byte files   {}",
+        "  resolution-sweeper 0-byte files   {}  (legacy pre-v1 sweeper; v1+ uses _resolutions.ndjson)",
         r.structural.resolution_zero_byte_files
+    );
+    println!(
+        "  tail-truncated files              {}  (last-line parse error only -- recoverable)",
+        r.structural.tail_truncated_files
+    );
+    println!(
+        "  interspersed-corrupt files        {}  (mid-file parse errors -- DATA AFTER MAY BE WRONG)",
+        r.structural.interspersed_corrupt_files
     );
     println!("  _unrouted files                   {}", r.structural.unrouted_files);
     println!(
@@ -417,16 +431,55 @@ fn print_text_report(r: &SessionIntegrity) {
         "  Binance depth snapshots observed  {}  (each snapshot resets the chain;",
         r.sequence.binance_depth_snapshots_observed
     );
-    println!("                                       breaks <= snapshots → expected reconnect/refresh,");
-    println!("                                       breaks  > snapshots → real packet loss)");
+    println!("                                       breaks <= snapshots -> expected reconnect/refresh,");
+    println!("                                       breaks  > snapshots -> real packet loss)");
+    println!(
+        "  Binance bookTicker update_id breaks {}  (out of {} observed)",
+        r.sequence.binance_book_ticker_update_id_breaks,
+        r.sequence.binance_book_ticker_observed
+    );
+    println!(
+        "  Polymarket per-asset ts violations {}",
+        r.sequence.polymarket_per_asset_ts_violations
+    );
+    println!(
+        "  Polymarket hash records           {}  (with hash: {}, consec dup: {})",
+        r.sequence.polymarket_hash_records_observed,
+        r.sequence.polymarket_hash_records_with_hash,
+        r.sequence.polymarket_hash_duplicate_consecutive
+    );
+    println!(
+        "  Coinbase trade_id breaks          {}  (out of {} observed)",
+        r.sequence.coinbase_trade_id_breaks,
+        r.sequence.coinbase_trade_id_observed
+    );
+    println!();
+
+    if let Some(d) = &r.binance_arrival_delta {
+        println!("binance arrival delta (local_ts_ns - venue_ts_ms*1e6)");
+        println!(
+            "  n={}  min={}ms  p10={}ms  p50={}ms  p90={}ms  p99={}ms  max={}ms",
+            d.n, d.min_ms, d.p10_ms, d.p50_ms, d.p90_ms, d.p99_ms, d.max_ms
+        );
+        println!();
+    }
+
+    if !r.safe_replay_cutoff_ns.is_empty() {
+        println!("safe replay cutoff (last clean event ns since epoch, per venue)");
+        for (venue, ns) in &r.safe_replay_cutoff_ns {
+            println!("  {:<12} {}", venue, ns);
+        }
+        println!();
+    }
 
     if !r.details.is_empty() {
-        println!();
         println!("details");
         for f in &r.details {
             let kind = match f.kind {
                 FindingKind::EmptyFile => "EmptyFile",
                 FindingKind::ResolutionZeroByte => "ResolutionZeroByte",
+                FindingKind::TailTruncated => "TailTruncated",
+                FindingKind::InterspersedCorrupt => "InterspersedCorrupt",
                 FindingKind::UnroutedFile => "UnroutedFile",
                 FindingKind::UnknownMarketFile => "UnknownMarketFile",
                 FindingKind::UnknownTokenFile => "UnknownTokenFile",
@@ -435,12 +488,16 @@ fn print_text_report(r: &SessionIntegrity) {
                 FindingKind::TsViolation => "TsViolation",
                 FindingKind::DecodeError => "DecodeError",
                 FindingKind::BinanceDepthChainBreak => "BinanceDepthChainBreak",
+                FindingKind::BinanceBookTickerUpdateIdBreak => "BinanceBookTickerUpdateIdBreak",
+                FindingKind::PolymarketPerAssetTsViolation => "PolymarketPerAssetTsViolation",
+                FindingKind::PolymarketHashDuplicate => "PolymarketHashDuplicate",
+                FindingKind::CoinbaseTradeIdBreak => "CoinbaseTradeIdBreak",
             };
             if f.note.is_empty() {
-                println!("  {} — {} ({})", f.path.display(), kind, f.count);
+                println!("  {} -- {} ({})", f.path.display(), kind, f.count);
             } else {
                 println!(
-                    "  {} — {} ({}, {})",
+                    "  {} -- {} ({}, {})",
                     f.path.display(),
                     kind,
                     f.count,
