@@ -7,6 +7,7 @@
 
 mod health;
 mod latency;
+mod meta;
 mod sweep;
 
 use std::path::PathBuf;
@@ -96,6 +97,27 @@ async fn main() -> ExitCode {
         session_dir = %store.session_dir().display(),
         "storage session opened"
     );
+
+    // Stamp the session with recorder version + config snapshot so a
+    // multi-version capture can be attributed at analysis time.
+    // Best-effort: if the write fails the recorder still runs; we just
+    // log and continue.
+    let session_dir_for_meta = store.session_dir().to_path_buf();
+    if let Err(e) = meta::write_session_meta(&session_dir_for_meta, &config_path, &cfg) {
+        tracing::warn!(
+            component = "recorder",
+            event = "session_meta_write_failed",
+            error = %e,
+            "could not write _session_meta.json; continuing"
+        );
+    } else {
+        tracing::info!(
+            component = "recorder",
+            event = "session_meta_written",
+            "session metadata sidecar written"
+        );
+    }
+
     let store = Arc::new(Mutex::new(store));
 
     // 4. Market registry + live gamma discovery.
@@ -186,10 +208,11 @@ async fn main() -> ExitCode {
     );
 
     // Latency probe — periodic TCP connect time to each venue endpoint.
-    // Logs to journald only; useful for cross-venue clock alignment and
-    // detecting routing changes.
-    let latency_handle = tokio::spawn(async {
-        latency::run_latency_probe_loop(Duration::from_secs(300)).await
+    // Logs to journald AND persists per-session to <session>/_latency_probes.ndjson
+    // so research code can apply per-venue latency floors at analysis time.
+    let latency_session_dir = session_dir_for_meta.clone();
+    let latency_handle = tokio::spawn(async move {
+        latency::run_latency_probe_loop(latency_session_dir, Duration::from_secs(300)).await
     });
     tracing::info!(
         component = "recorder",
