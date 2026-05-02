@@ -169,6 +169,86 @@ pub struct RawEvent {
 }
 
 // ---------------------------------------------------------------------------
+// ResolutionRecord — sidecar resolution metadata
+// ---------------------------------------------------------------------------
+
+/// One per-market resolution record. Written one-per-line into
+/// `<session>/_resolutions.ndjson` by the recorder's resolution sweeper,
+/// read by the replayer and any downstream analysis that needs
+/// ground-truth Up/Down outcomes.
+///
+/// **Why a sidecar, not a `RawEvent`?** Resolutions come from a REST API
+/// (Polymarket Gamma `/events?closed=true`), not a venue WebSocket. They
+/// describe metadata about the *market*, not a market event. Mixing them
+/// into the venue stream would muddy replay; keeping them in a single
+/// session-level file is also robust against the per-slug 0-byte-file
+/// failure mode the previous sweeper hit during disk-pressure events.
+///
+/// **Schema versioning.** `schema_version` lets future readers detect
+/// breaking changes; bump when the shape changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionRecord {
+    pub schema_version: u32,
+    /// Local wall-clock when the sweeper observed this resolution, ns
+    /// since epoch. Stringified for the same precision-preserving reason
+    /// `RawEvent.local_ts_ns` is.
+    pub ts_ns: String,
+    /// Identifier of the source/method, e.g. `"gamma_v1"`. Lets analysis
+    /// distinguish records produced by different sources if we ever add
+    /// alternates.
+    pub source: String,
+    pub market: ResolutionMarket,
+    pub tokens: ResolutionTokens,
+    pub outcome: ResolutionOutcome,
+    /// The full re-serialised gamma event JSON for forensics. Kept so
+    /// future analysis can recover any field this struct doesn't expose
+    /// without re-querying gamma.
+    pub raw_gamma_event: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionMarket {
+    pub slug: String,
+    pub condition_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub question: Option<String>,
+    /// ISO-8601 strings as gamma reports them. Kept verbatim.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_date: Option<String>,
+    /// Epoch seconds parsed from the slug suffix or end_date. Useful for
+    /// numeric range filters.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_time_epoch: Option<i64>,
+    pub end_time_epoch: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionTokens {
+    /// `clobTokenIds[0]` from gamma — the token that pays out when the
+    /// first outcome (e.g. `"Up"` for the BTC up/down series) wins.
+    /// Known at market *creation* time, not at resolution time, so this
+    /// field is leakage-free for any predictive use.
+    pub up_token: String,
+    pub down_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionOutcome {
+    /// The label of the winning outcome — e.g. `"Up"` or `"Down"` for
+    /// the BTC series, or `"Yes"`/`"No"` for binary markets in other
+    /// series. Comes from gamma's `outcomes[i]` where `outcomePrices[i] == "1"`.
+    /// **Never** inferred from terminal market price.
+    pub winner_label: String,
+    /// Both outcome labels, in declaration order (matches `clobTokenIds`).
+    pub outcome_labels: Vec<String>,
+    /// `outcomePrices` from gamma, declaration order. Will be `["1","0"]`
+    /// or `["0","1"]` for cleanly-resolved markets.
+    pub outcome_prices: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -250,5 +330,70 @@ mod tests {
             line,
             r#"{"venue":"binance","stream":"btcusdt@trade","local_ts_ns":"1","venue_ts_ms":42,"payload":"p"}"#
         );
+    }
+
+    #[test]
+    fn resolution_record_round_trips_through_serde() {
+        let r = ResolutionRecord {
+            schema_version: 1,
+            ts_ns: "1777523971487807791".into(),
+            source: "gamma_v1".into(),
+            market: ResolutionMarket {
+                slug: "btc-updown-5m-1777206000".into(),
+                condition_id: "0xabc".into(),
+                question: Some("Bitcoin Up or Down — 12:30 PM ET".into()),
+                start_date: Some("2026-04-26T12:25:00Z".into()),
+                end_date: Some("2026-04-26T12:30:00Z".into()),
+                start_time_epoch: Some(1_777_205_700),
+                end_time_epoch: 1_777_206_000,
+            },
+            tokens: ResolutionTokens {
+                up_token: "10161".into(),
+                down_token: "11061".into(),
+            },
+            outcome: ResolutionOutcome {
+                winner_label: "Up".into(),
+                outcome_labels: vec!["Up".into(), "Down".into()],
+                outcome_prices: vec!["1".into(), "0".into()],
+            },
+            raw_gamma_event: r#"{"slug":"btc-updown-5m-1777206000"}"#.into(),
+        };
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(!line.contains('\n'));
+        let parsed: ResolutionRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn resolution_record_omits_optional_fields_when_none() {
+        let r = ResolutionRecord {
+            schema_version: 1,
+            ts_ns: "0".into(),
+            source: "gamma_v1".into(),
+            market: ResolutionMarket {
+                slug: "x".into(),
+                condition_id: "0x0".into(),
+                question: None,
+                start_date: None,
+                end_date: None,
+                start_time_epoch: None,
+                end_time_epoch: 0,
+            },
+            tokens: ResolutionTokens {
+                up_token: "u".into(),
+                down_token: "d".into(),
+            },
+            outcome: ResolutionOutcome {
+                winner_label: "Up".into(),
+                outcome_labels: vec!["Up".into(), "Down".into()],
+                outcome_prices: vec!["1".into(), "0".into()],
+            },
+            raw_gamma_event: "{}".into(),
+        };
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(!line.contains("question"));
+        assert!(!line.contains("start_date"));
+        assert!(!line.contains("end_date"));
+        assert!(!line.contains("start_time_epoch"));
     }
 }
