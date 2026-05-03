@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::process::ExitCode;
 
+use common::ResolutionRecord;
 use replayer::integrity::{check_session, FindingKind, SessionIntegrity};
 use replayer::{open_base_dir, open_session, ReplayError, ReplayFilter, SessionDir};
 
@@ -41,6 +42,7 @@ fn main() -> ExitCode {
         Command::Tail { root, filter, n } => run_tail(&root, filter, n),
         Command::Dump { root, filter, out } => run_dump(&root, filter, &out),
         Command::Integrity { root, verbose, json } => run_integrity(&root, verbose, json),
+        Command::ValidateResolutions { root } => run_validate_resolutions(&root),
         Command::Schema => run_schema(),
     };
 
@@ -146,6 +148,197 @@ fn run_schema() -> Result<(), ReplayError> {
     Ok(())
 }
 
+/// Validate that each session's `_resolutions.ndjson` sidecar (and/or
+/// any legacy `<slug>-resolved.0000.ndjson` files) is present and
+/// parseable. PASS / WARN / FAIL per session, plus a final summary.
+///
+/// PASS: sidecar present, every line parses, schema_version recognised.
+/// WARN: sidecar absent but legacy resolved files present (old session
+///       captured before the v1 sweeper rewrite); legacy 0-byte files
+///       are reported but not failures since they predate the fix.
+/// FAIL: sidecar present but contains malformed records.
+fn run_validate_resolutions(root: &Path) -> Result<(), ReplayError> {
+    let sessions: Vec<SessionDir> = match SessionDir::from_path(root) {
+        Ok(sd) => vec![sd],
+        Err(_) => SessionDir::discover(root)?,
+    };
+
+    let mut total_sessions = 0usize;
+    let mut total_pass = 0usize;
+    let mut total_warn = 0usize;
+    let mut total_fail = 0usize;
+
+    for sd in &sessions {
+        total_sessions += 1;
+        let res = validate_session_resolutions(&sd.path);
+        match res.verdict.as_str() {
+            "PASS" => total_pass += 1,
+            "WARN" => total_warn += 1,
+            "FAIL" => total_fail += 1,
+            _ => {}
+        }
+        println!("{}: {}", sd.start_utc, res.verdict);
+        println!("  sidecar:           {}", res.sidecar_state);
+        println!("  sidecar lines:     {}", res.sidecar_lines);
+        println!("  parsed records:    {}", res.parsed_records);
+        println!("  parse errors:      {}", res.parse_errors);
+        if !res.schema_versions.is_empty() {
+            println!(
+                "  schema versions:   {}",
+                res.schema_versions
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        println!(
+            "  legacy resolved files (informational):  total={} non-empty={} zero-byte={}",
+            res.legacy_total_files, res.legacy_nonempty_files, res.legacy_zero_byte_files
+        );
+        for note in &res.notes {
+            println!("  note: {note}");
+        }
+    }
+
+    println!();
+    println!(
+        "summary: {} sessions, {} PASS, {} WARN, {} FAIL",
+        total_sessions, total_pass, total_warn, total_fail
+    );
+
+    if total_fail > 0 {
+        // Non-fatal but signal the failure to the caller via stderr +
+        // a non-zero exit on the way out. We use ReplayError::Io as a
+        // close-fitting variant; main maps any Err to exit 4.
+        return Err(ReplayError::Io {
+            path: root.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "one or more sessions failed validation",
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ValidateResult {
+    verdict: String,
+    sidecar_state: String,
+    sidecar_lines: usize,
+    parsed_records: usize,
+    parse_errors: usize,
+    schema_versions: Vec<u32>,
+    legacy_total_files: usize,
+    legacy_nonempty_files: usize,
+    legacy_zero_byte_files: usize,
+    notes: Vec<String>,
+}
+
+fn validate_session_resolutions(session_dir: &Path) -> ValidateResult {
+    use std::fs;
+    use std::io::BufRead;
+    let mut r = ValidateResult::default();
+    let sidecar_path = session_dir.join("_resolutions.ndjson");
+    let mut versions = std::collections::BTreeSet::new();
+
+    if sidecar_path.is_file() {
+        let size = fs::metadata(&sidecar_path).map(|m| m.len()).unwrap_or(0);
+        r.sidecar_state = format!("present ({} bytes)", size);
+        if let Ok(file) = fs::File::open(&sidecar_path) {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if l.trim().is_empty() {
+                            continue;
+                        }
+                        r.sidecar_lines += 1;
+                        match serde_json::from_str::<ResolutionRecord>(&l) {
+                            Ok(rec) => {
+                                r.parsed_records += 1;
+                                versions.insert(rec.schema_version);
+                            }
+                            Err(e) => {
+                                r.parse_errors += 1;
+                                if r.notes.len() < 3 {
+                                    r.notes.push(format!(
+                                        "parse error on line {}: {}",
+                                        r.sidecar_lines, e
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        r.parse_errors += 1;
+                        r.notes.push(format!("read error: {}", e));
+                        break;
+                    }
+                }
+            }
+        } else {
+            r.notes.push("sidecar exists but couldn't open for reading".into());
+        }
+    } else {
+        r.sidecar_state = "absent".into();
+    }
+    r.schema_versions = versions.into_iter().collect();
+
+    // Legacy per-slug resolved files (informational).
+    let poly_dir = session_dir.join("polymarket");
+    if poly_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&poly_dir) {
+            for e in entries.flatten() {
+                let name = match e.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if name.contains("-resolved")
+                    && (name.ends_with(".ndjson") || name.ends_with(".ndjson.gz"))
+                {
+                    r.legacy_total_files += 1;
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    if size == 0 {
+                        r.legacy_zero_byte_files += 1;
+                    } else {
+                        r.legacy_nonempty_files += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Verdict logic.
+    r.verdict = if r.parse_errors > 0 {
+        "FAIL".into()
+    } else if !sidecar_path.is_file() {
+        if r.legacy_nonempty_files > 0 {
+            r.notes.push(
+                "no sidecar but legacy resolved files present (pre-v1 sweeper)".into(),
+            );
+            "WARN".into()
+        } else if r.legacy_zero_byte_files > 0 {
+            r.notes.push(format!(
+                "{} legacy resolved files exist but are 0 bytes (the bug we fixed)",
+                r.legacy_zero_byte_files
+            ));
+            "WARN".into()
+        } else {
+            r.notes.push("no resolution data of any kind".into());
+            "WARN".into()
+        }
+    } else if r.parsed_records == 0 {
+        r.notes.push("sidecar present but empty".into());
+        "WARN".into()
+    } else {
+        "PASS".into()
+    };
+
+    r
+}
+
 fn run_integrity(root: &Path, verbose: bool, json: bool) -> Result<(), ReplayError> {
     // Single session dir → check it. Otherwise treat as base dir and
     // emit one summary per discovered session, in chronological order.
@@ -178,6 +371,12 @@ fn print_text_report(r: &SessionIntegrity) {
     );
     println!();
 
+    println!("VERDICT: {}", r.verdict);
+    if !r.verdict_reason.is_empty() {
+        println!("  reason: {}", r.verdict_reason);
+    }
+    println!();
+
     println!("per-venue");
     for (venue, stats) in &r.per_venue {
         println!(
@@ -190,8 +389,16 @@ fn print_text_report(r: &SessionIntegrity) {
     println!("structural");
     println!("  empty files                       {}", r.structural.empty_files);
     println!(
-        "  resolution-sweeper 0-byte files   {}",
+        "  resolution-sweeper 0-byte files   {}  (legacy pre-v1 sweeper; v1+ uses _resolutions.ndjson)",
         r.structural.resolution_zero_byte_files
+    );
+    println!(
+        "  tail-truncated files              {}  (last-line parse error only -- recoverable)",
+        r.structural.tail_truncated_files
+    );
+    println!(
+        "  interspersed-corrupt files        {}  (mid-file parse errors -- DATA AFTER MAY BE WRONG)",
+        r.structural.interspersed_corrupt_files
     );
     println!("  _unrouted files                   {}", r.structural.unrouted_files);
     println!(
@@ -224,16 +431,55 @@ fn print_text_report(r: &SessionIntegrity) {
         "  Binance depth snapshots observed  {}  (each snapshot resets the chain;",
         r.sequence.binance_depth_snapshots_observed
     );
-    println!("                                       breaks <= snapshots → expected reconnect/refresh,");
-    println!("                                       breaks  > snapshots → real packet loss)");
+    println!("                                       breaks <= snapshots -> expected reconnect/refresh,");
+    println!("                                       breaks  > snapshots -> real packet loss)");
+    println!(
+        "  Binance bookTicker update_id breaks {}  (out of {} observed)",
+        r.sequence.binance_book_ticker_update_id_breaks,
+        r.sequence.binance_book_ticker_observed
+    );
+    println!(
+        "  Polymarket per-asset ts violations {}",
+        r.sequence.polymarket_per_asset_ts_violations
+    );
+    println!(
+        "  Polymarket hash records           {}  (with hash: {}, consec dup: {})",
+        r.sequence.polymarket_hash_records_observed,
+        r.sequence.polymarket_hash_records_with_hash,
+        r.sequence.polymarket_hash_duplicate_consecutive
+    );
+    println!(
+        "  Coinbase trade_id breaks          {}  (out of {} observed)",
+        r.sequence.coinbase_trade_id_breaks,
+        r.sequence.coinbase_trade_id_observed
+    );
+    println!();
+
+    if let Some(d) = &r.binance_arrival_delta {
+        println!("binance arrival delta (local_ts_ns - venue_ts_ms*1e6)");
+        println!(
+            "  n={}  min={}ms  p10={}ms  p50={}ms  p90={}ms  p99={}ms  max={}ms",
+            d.n, d.min_ms, d.p10_ms, d.p50_ms, d.p90_ms, d.p99_ms, d.max_ms
+        );
+        println!();
+    }
+
+    if !r.safe_replay_cutoff_ns.is_empty() {
+        println!("safe replay cutoff (last clean event ns since epoch, per venue)");
+        for (venue, ns) in &r.safe_replay_cutoff_ns {
+            println!("  {:<12} {}", venue, ns);
+        }
+        println!();
+    }
 
     if !r.details.is_empty() {
-        println!();
         println!("details");
         for f in &r.details {
             let kind = match f.kind {
                 FindingKind::EmptyFile => "EmptyFile",
                 FindingKind::ResolutionZeroByte => "ResolutionZeroByte",
+                FindingKind::TailTruncated => "TailTruncated",
+                FindingKind::InterspersedCorrupt => "InterspersedCorrupt",
                 FindingKind::UnroutedFile => "UnroutedFile",
                 FindingKind::UnknownMarketFile => "UnknownMarketFile",
                 FindingKind::UnknownTokenFile => "UnknownTokenFile",
@@ -242,12 +488,16 @@ fn print_text_report(r: &SessionIntegrity) {
                 FindingKind::TsViolation => "TsViolation",
                 FindingKind::DecodeError => "DecodeError",
                 FindingKind::BinanceDepthChainBreak => "BinanceDepthChainBreak",
+                FindingKind::BinanceBookTickerUpdateIdBreak => "BinanceBookTickerUpdateIdBreak",
+                FindingKind::PolymarketPerAssetTsViolation => "PolymarketPerAssetTsViolation",
+                FindingKind::PolymarketHashDuplicate => "PolymarketHashDuplicate",
+                FindingKind::CoinbaseTradeIdBreak => "CoinbaseTradeIdBreak",
             };
             if f.note.is_empty() {
-                println!("  {} — {} ({})", f.path.display(), kind, f.count);
+                println!("  {} -- {} ({})", f.path.display(), kind, f.count);
             } else {
                 println!(
-                    "  {} — {} ({}, {})",
+                    "  {} -- {} ({}, {})",
                     f.path.display(),
                     kind,
                     f.count,

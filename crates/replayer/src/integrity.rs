@@ -61,6 +61,24 @@ pub struct SessionIntegrity {
     pub decoder: DecoderIssues,
     pub sequence: SequenceIssues,
 
+    /// Network-arrival vs exchange-emit delta. Populated for venues where
+    /// every event carries `venue_ts_ms` (Binance trades + depth diffs).
+    /// Polymarket and Coinbase have inconsistent venue timestamps so are
+    /// not summarised here.
+    pub binance_arrival_delta: Option<TimingDelta>,
+
+    /// Last clean event timestamp per venue (ns since epoch as string).
+    /// "Clean" = before any structural or sequence issue surfaced for
+    /// that venue. Use as a safe upper bound for replay/analysis.
+    /// Stringified for the same precision-preserving reason
+    /// `RawEvent.local_ts_ns` is.
+    pub safe_replay_cutoff_ns: BTreeMap<String, String>,
+
+    /// PASS / WARN / FAIL.
+    pub verdict: String,
+    /// Short human-readable reason for the verdict.
+    pub verdict_reason: String,
+
     /// Per-file findings. Empty unless the caller passed `verbose = true`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<FileFinding>,
@@ -75,7 +93,17 @@ pub struct VenueStats {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StructuralIssues {
     pub empty_files: u64,
+    /// Subset of empty_files: per-slug `*-resolved.ndjson` files left empty
+    /// by the legacy sweeper. Always 0 for sessions captured under the v1
+    /// sidecar sweeper.
     pub resolution_zero_byte_files: u64,
+    /// Files with a tail-only parse error (last line malformed, all
+    /// preceding lines parse). Classic partial-write signature, recoverable
+    /// by replay-truncating at the last valid line.
+    pub tail_truncated_files: u64,
+    /// Files with mid-file parse errors (any non-final line fails to parse).
+    /// Concerning because data after the bad line may be misaligned.
+    pub interspersed_corrupt_files: u64,
     pub unrouted_files: u64,
     pub unknown_market_files: u64,
     pub unknown_token_files: u64,
@@ -104,6 +132,49 @@ pub struct SequenceIssues {
     /// re-baselines the diff chain, so breaks at snapshot boundaries are
     /// expected; `breaks <= snapshots` is the typical pattern.
     pub binance_depth_snapshots_observed: u64,
+
+    /// Binance bookTicker `update_id` non-monotonic deltas. The wire
+    /// guarantees strictly increasing update_id; any decrease or repeat
+    /// (after the first event) is a real signal of dropped or reordered
+    /// frames.
+    pub binance_book_ticker_update_id_breaks: u64,
+    pub binance_book_ticker_observed: u64,
+
+    /// Polymarket per-asset timestamp_ms non-monotonic events. Many events
+    /// share the same wire-frame timestamp by design (array demux), so we
+    /// only count strict decreases. Missing timestamp_ms is *not* counted.
+    pub polymarket_per_asset_ts_violations: u64,
+    /// Polymarket book + price_change items observed (that carry a
+    /// `hash` field). Recorded so callers can tell whether the next two
+    /// fields are statistically meaningful.
+    pub polymarket_hash_records_observed: u64,
+    /// Records with a hash field set. `polymarket_hash_records_observed -
+    /// polymarket_hash_records_with_hash = records missing hash`.
+    pub polymarket_hash_records_with_hash: u64,
+    /// Consecutive identical hashes for the *same* `asset_id`. Polymarket
+    /// emits a fresh hash on every state change; consecutive duplicates
+    /// suggest either a genuinely-unchanged book or a wire issue.
+    pub polymarket_hash_duplicate_consecutive: u64,
+
+    /// Coinbase trade_id non-monotonic events. Trade ids are strings on
+    /// the wire; we parse to u64 when possible and compare numerically.
+    pub coinbase_trade_id_breaks: u64,
+    pub coinbase_trade_id_observed: u64,
+}
+
+/// Distribution summary of the delta `local_ts_ns - venue_ts_ms*1e6` for
+/// venues that publish an exchange-side timestamp on every event. Useful
+/// for (a) detecting routing changes / regional failover (median jumps),
+/// (b) bounding the noise floor of any sub-second timing analysis.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TimingDelta {
+    pub n: u64,
+    pub min_ms: i64,
+    pub max_ms: i64,
+    pub p10_ms: i64,
+    pub p50_ms: i64,
+    pub p90_ms: i64,
+    pub p99_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +191,8 @@ pub struct FileFinding {
 pub enum FindingKind {
     EmptyFile,
     ResolutionZeroByte,
+    TailTruncated,
+    InterspersedCorrupt,
     UnroutedFile,
     UnknownMarketFile,
     UnknownTokenFile,
@@ -128,6 +201,10 @@ pub enum FindingKind {
     TsViolation,
     DecodeError,
     BinanceDepthChainBreak,
+    BinanceBookTickerUpdateIdBreak,
+    PolymarketPerAssetTsViolation,
+    PolymarketHashDuplicate,
+    CoinbaseTradeIdBreak,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +231,10 @@ pub fn check_session(
         structural: StructuralIssues::default(),
         decoder: DecoderIssues::default(),
         sequence: SequenceIssues::default(),
+        binance_arrival_delta: None,
+        safe_replay_cutoff_ns: BTreeMap::new(),
+        verdict: String::new(),
+        verdict_reason: String::new(),
         details: Vec::new(),
     };
 
@@ -265,6 +346,25 @@ pub fn check_session(
     // Persists across files within a stream so chain checks see rotated
     // buckets as one continuous sequence.
     let mut depth_chain_state: BTreeMap<(Venue, String), Option<u64>> = BTreeMap::new();
+    let mut book_ticker_state: BTreeMap<(Venue, String), Option<u64>> = BTreeMap::new();
+    let mut coinbase_trade_id_state: BTreeMap<(Venue, String), Option<u64>> = BTreeMap::new();
+    // Polymarket per-asset state (asset_id -> last_ts_ms / last_hash).
+    let mut poly_asset_ts_state: BTreeMap<String, i64> = BTreeMap::new();
+    let mut poly_asset_hash_state: BTreeMap<String, String> = BTreeMap::new();
+
+    // Binance arrival-delta sample buffer. Capped to keep memory bounded
+    // (a 13h capture has ~3M trade events; storing all i64 deltas = 24 MB,
+    // not catastrophic but unnecessary). Reservoir-sampled.
+    const BIN_DELTA_CAP: usize = 100_000;
+    let mut bin_delta_samples: Vec<i64> = Vec::with_capacity(BIN_DELTA_CAP);
+    let mut bin_delta_count: u64 = 0;
+
+    // Per-venue last cleanly-scanned event ts. "Cleanly" = no parse error
+    // in this event, no ts violation in this event, no decode error, and
+    // no sequence break attributable to this event. Once a venue records
+    // an issue, its last_clean_ns *stops advancing*.
+    let mut last_clean_ns_by_venue: BTreeMap<Venue, u128> = BTreeMap::new();
+    let mut venue_dirty: BTreeMap<Venue, bool> = BTreeMap::new();
 
     for f in &files {
         report.files_scanned += 1;
@@ -278,6 +378,12 @@ pub fn check_session(
         let mut local_decode_errors_in_file: u64 = 0;
         let mut local_ts_violations_in_file: u64 = 0;
         let mut local_chain_breaks_in_file: u64 = 0;
+        // Tail-truncation detection: track whether we've seen a parse error,
+        // whether the last iteration was a parse error, and whether any
+        // event came AFTER a parse error.
+        let mut had_parse_error = false;
+        let mut last_was_parse_error = false;
+        let mut had_event_after_parse_error = false;
 
         let depth_state = depth_chain_state
             .entry((f.venue, f.stream.clone()))
@@ -289,10 +395,18 @@ pub fn check_session(
                 Err(ReplayError::ParseLine { .. }) => {
                     report.structural.parse_errors += 1;
                     local_parse_errors_in_file += 1;
+                    had_parse_error = true;
+                    last_was_parse_error = true;
+                    venue_dirty.insert(f.venue, true);
                     continue;
                 }
                 Err(other) => return Err(other),
                 Ok((_line_no, event)) => {
+                    if last_was_parse_error {
+                        had_event_after_parse_error = true;
+                    }
+                    last_was_parse_error = false;
+
                     report.total_events += 1;
                     if let Some(stats) =
                         report.per_venue.get_mut(event.venue.as_str())
@@ -300,36 +414,192 @@ pub fn check_session(
                         stats.events += 1;
                     }
                     let ts = event.local_ts_ns.as_nanos();
+
+                    let mut event_has_issue = false;
+
+                    // Per-file ts ordering.
                     if let Some(prev) = last_local_ts_ns {
                         if ts < prev {
                             report.structural.ts_violations += 1;
                             local_ts_violations_in_file += 1;
+                            event_has_issue = true;
                         }
                     }
                     last_local_ts_ns = Some(ts);
 
+                    // Binance arrival delta: local_ts_ns - venue_ts_ms*1e6.
+                    if event.venue == Venue::Binance {
+                        if let Some(venue_ms) = event.venue_ts_ms {
+                            let local_ms = (ts / 1_000_000) as i64;
+                            let delta_ms = local_ms - venue_ms;
+                            bin_delta_count += 1;
+                            if bin_delta_samples.len() < BIN_DELTA_CAP {
+                                bin_delta_samples.push(delta_ms);
+                            } else {
+                                // Reservoir sample: each new element gets a
+                                // 1/n chance of replacing a random slot.
+                                let n = bin_delta_count as usize;
+                                let r = pseudo_rand_index(n);
+                                if r < BIN_DELTA_CAP {
+                                    bin_delta_samples[r] = delta_ms;
+                                }
+                            }
+                        }
+                    }
+
+                    // Decoder + sequence checks.
                     match decode(&event) {
                         Err(_) => {
                             report.decoder.decode_errors += 1;
                             local_decode_errors_in_file += 1;
+                            event_has_issue = true;
                         }
                         Ok(DecodedEvent::Unknown { .. }) => {
                             report.decoder.unknown_variants += 1;
                         }
                         Ok(DecodedEvent::BinanceDepthSnapshot(_)) => {
                             report.sequence.binance_depth_snapshots_observed += 1;
+                            // A snapshot resets the chain — clearing the
+                            // stale state prevents the next diff from
+                            // wrongly counting as a break.
+                            *depth_state = None;
                         }
                         Ok(DecodedEvent::BinanceDepthDiff(d)) => {
                             if let Some(prev_u) = *depth_state {
                                 if d.first_update_id != prev_u + 1 {
                                     report.sequence.binance_depth_chain_breaks += 1;
                                     local_chain_breaks_in_file += 1;
+                                    // Chain breaks are expected at reconnect
+                                    // boundaries (we have a snapshot count
+                                    // to distinguish), so don't poison the
+                                    // venue safe-cutoff.
                                 }
                             }
                             *depth_state = Some(d.final_update_id);
                         }
+                        Ok(DecodedEvent::BinanceBookTicker(bt)) => {
+                            report.sequence.binance_book_ticker_observed += 1;
+                            let key = (event.venue, event.stream.clone());
+                            let entry = book_ticker_state.entry(key).or_insert(None);
+                            if let Some(prev_u) = *entry {
+                                if bt.update_id <= prev_u {
+                                    report.sequence.binance_book_ticker_update_id_breaks += 1;
+                                    event_has_issue = true;
+                                }
+                            }
+                            *entry = Some(bt.update_id);
+                        }
+                        Ok(DecodedEvent::PolymarketBook(b)) => {
+                            check_poly_per_asset_ts(
+                                &b.asset_id,
+                                b.timestamp_ms,
+                                &mut poly_asset_ts_state,
+                                &mut report.sequence.polymarket_per_asset_ts_violations,
+                                &mut event_has_issue,
+                            );
+                            check_poly_hash(
+                                &b.asset_id,
+                                b.hash.as_deref(),
+                                &mut poly_asset_hash_state,
+                                &mut report.sequence,
+                            );
+                        }
+                        Ok(DecodedEvent::PolymarketPriceChange(pc)) => {
+                            for it in &pc.price_changes {
+                                check_poly_per_asset_ts(
+                                    &it.asset_id,
+                                    pc.timestamp_ms,
+                                    &mut poly_asset_ts_state,
+                                    &mut report.sequence.polymarket_per_asset_ts_violations,
+                                    &mut event_has_issue,
+                                );
+                                check_poly_hash(
+                                    &it.asset_id,
+                                    it.hash.as_deref(),
+                                    &mut poly_asset_hash_state,
+                                    &mut report.sequence,
+                                );
+                            }
+                        }
+                        Ok(DecodedEvent::CoinbaseMarketTrades(cm)) => {
+                            // CoinbaseMarketTrades wraps inner events with
+                            // a `snapshot` (reconnect) batch + `update`
+                            // batches. `flatten()` iterates trades across
+                            // all inner batches. A `snapshot` batch is a
+                            // resync and resets the chain; we treat it as
+                            // a baseline and don't count breaks against
+                            // events seen after it.
+                            //
+                            // Coinbase emits trades within a batch in
+                            // reverse-chronological order (newest first).
+                            // Walking them in receive order would falsely
+                            // flag every multi-trade frame as a break;
+                            // sort ascending before the monotonicity
+                            // check so we only see real cross-batch gaps.
+                            let key = (event.venue, event.stream.clone());
+                            let entry =
+                                coinbase_trade_id_state.entry(key).or_insert(None);
+                            let is_snapshot = cm
+                                .events
+                                .iter()
+                                .any(|b| b.kind.eq_ignore_ascii_case("snapshot"));
+                            if is_snapshot {
+                                *entry = None;
+                            }
+                            let mut batch_ids: Vec<u64> = Vec::new();
+                            for tr in cm.flatten() {
+                                report.sequence.coinbase_trade_id_observed += 1;
+                                if let Ok(id) = tr.trade_id.parse::<u64>() {
+                                    batch_ids.push(id);
+                                }
+                            }
+                            batch_ids.sort_unstable();
+                            for id in &batch_ids {
+                                if let Some(prev) = *entry {
+                                    if *id <= prev {
+                                        report.sequence.coinbase_trade_id_breaks += 1;
+                                        event_has_issue = true;
+                                    }
+                                }
+                                *entry = Some(*id);
+                            }
+                        }
                         Ok(_) => {}
                     }
+
+                    if event_has_issue {
+                        venue_dirty.insert(event.venue, true);
+                    } else if !venue_dirty.get(&event.venue).copied().unwrap_or(false) {
+                        let entry = last_clean_ns_by_venue.entry(event.venue).or_insert(0);
+                        if ts > *entry {
+                            *entry = ts;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Classify file-level corruption (tail-only vs interspersed).
+        if had_parse_error {
+            if had_event_after_parse_error {
+                report.structural.interspersed_corrupt_files += 1;
+                if verbose {
+                    report.details.push(FileFinding {
+                        path: f.path.clone(),
+                        kind: FindingKind::InterspersedCorrupt,
+                        count: local_parse_errors_in_file,
+                        note: "non-final parse errors -- data after them may be misaligned".into(),
+                    });
+                }
+            } else if last_was_parse_error {
+                report.structural.tail_truncated_files += 1;
+                if verbose {
+                    report.details.push(FileFinding {
+                        path: f.path.clone(),
+                        kind: FindingKind::TailTruncated,
+                        count: local_parse_errors_in_file,
+                        note: "tail truncation -- recoverable, replay can stop at last valid line".into(),
+                    });
                 }
             }
         }
@@ -370,8 +640,127 @@ pub fn check_session(
         }
     }
 
+    // ---- Aggregation ----
+    if !bin_delta_samples.is_empty() {
+        bin_delta_samples.sort_unstable();
+        let n = bin_delta_samples.len();
+        let pick = |q: f64| -> i64 {
+            let idx = ((n as f64 - 1.0) * q) as usize;
+            bin_delta_samples[idx]
+        };
+        report.binance_arrival_delta = Some(TimingDelta {
+            n: bin_delta_count,
+            min_ms: bin_delta_samples[0],
+            max_ms: bin_delta_samples[n - 1],
+            p10_ms: pick(0.10),
+            p50_ms: pick(0.50),
+            p90_ms: pick(0.90),
+            p99_ms: pick(0.99),
+        });
+    }
+    for (venue, ts) in &last_clean_ns_by_venue {
+        report
+            .safe_replay_cutoff_ns
+            .insert(venue.as_str().to_string(), ts.to_string());
+    }
+
+    // Verdict.
+    let s = &report.structural;
+    let q = &report.sequence;
+    let book_ticker_breaks_unexplained = q.binance_book_ticker_update_id_breaks;
+    // Depth chain breaks within snapshot count are "expected reconnect/refresh".
+    let depth_breaks_unexplained = q
+        .binance_depth_chain_breaks
+        .saturating_sub(q.binance_depth_snapshots_observed);
+
+    if s.interspersed_corrupt_files > 0 {
+        report.verdict = "FAIL".into();
+        report.verdict_reason = format!(
+            "{} file(s) with mid-file parse errors -- data after the bad lines may be misaligned",
+            s.interspersed_corrupt_files
+        );
+    } else if depth_breaks_unexplained > 0
+        || book_ticker_breaks_unexplained > 0
+        || q.coinbase_trade_id_breaks > 0
+        || q.polymarket_per_asset_ts_violations > 0
+        || s.ts_violations > 0
+        || report.decoder.decode_errors > 0
+    {
+        report.verdict = "WARN".into();
+        report.verdict_reason = format!(
+            "tail_truncated_files={}, depth_breaks_unexplained={}, book_ticker_breaks={}, coinbase_trade_id_breaks={}, polymarket_ts_violations={}, ts_violations={}, decode_errors={}",
+            s.tail_truncated_files,
+            depth_breaks_unexplained,
+            book_ticker_breaks_unexplained,
+            q.coinbase_trade_id_breaks,
+            q.polymarket_per_asset_ts_violations,
+            s.ts_violations,
+            report.decoder.decode_errors,
+        );
+    } else if s.tail_truncated_files > 0 {
+        report.verdict = "WARN".into();
+        report.verdict_reason = format!(
+            "{} file(s) with tail-only truncation -- recoverable",
+            s.tail_truncated_files
+        );
+    } else {
+        report.verdict = "PASS".into();
+        report.verdict_reason = "no integrity issues detected".into();
+    }
+
     report.elapsed_secs = started.elapsed().as_secs_f64();
     Ok(report)
+}
+
+/// One Polymarket per-asset timestamp_ms ordering check. `ts` is the
+/// best timestamp available for this event (book.timestamp_ms or
+/// price_change.timestamp_ms). Missing timestamps are not counted; many
+/// real events legitimately omit it.
+fn check_poly_per_asset_ts(
+    asset_id: &str,
+    ts: Option<i64>,
+    state: &mut BTreeMap<String, i64>,
+    counter: &mut u64,
+    event_has_issue: &mut bool,
+) {
+    if let Some(t) = ts {
+        let entry = state.entry(asset_id.to_string()).or_insert(t);
+        if t < *entry {
+            *counter += 1;
+            *event_has_issue = true;
+        } else {
+            *entry = t;
+        }
+    }
+}
+
+fn check_poly_hash(
+    asset_id: &str,
+    hash: Option<&str>,
+    state: &mut BTreeMap<String, String>,
+    seq: &mut SequenceIssues,
+) {
+    seq.polymarket_hash_records_observed += 1;
+    if let Some(h) = hash {
+        seq.polymarket_hash_records_with_hash += 1;
+        let entry = state.entry(asset_id.to_string()).or_insert_with(String::new);
+        if !entry.is_empty() && entry == h {
+            seq.polymarket_hash_duplicate_consecutive += 1;
+        }
+        *entry = h.to_string();
+    }
+}
+
+/// Tiny PRNG-free index sampler for reservoir sampling. Not crypto-strength —
+/// used purely to spread sample replacement evenly across the stream so
+/// quantile estimates aren't biased toward early samples.
+fn pseudo_rand_index(n: usize) -> usize {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0);
+    nanos.wrapping_mul(2_654_435_769) % n.max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +827,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(ts),
             venue_ts_ms: None,
             payload: payload.into(),
+            ..Default::default()
         };
         serde_json::to_string(&ev).unwrap()
     }
@@ -660,5 +1050,262 @@ mod tests {
         write_file(&session, "binance", "btcusdt_trade.0000.ndjson", &[]);
         let r = check_session(&sd, false).unwrap();
         assert!(r.details.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // v2: tail-truncated vs interspersed-corrupt classification
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tail_truncated_file_classified() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let good = raw_event_line(Venue::Binance, "btcusdt@trade", 100, r#"{"e":"trade"}"#);
+        // Last line is malformed — classic partial-write signature.
+        write_file(
+            &session,
+            "binance",
+            "btcusdt_trade.0000.ndjson",
+            &[&good, &good, "this is not json"],
+        );
+        let r = check_session(&sd, true).unwrap();
+        assert_eq!(r.structural.tail_truncated_files, 1);
+        assert_eq!(r.structural.interspersed_corrupt_files, 0);
+        assert_eq!(r.structural.parse_errors, 1);
+        assert!(r.details.iter().any(|d| d.kind == FindingKind::TailTruncated));
+    }
+
+    #[test]
+    fn interspersed_corruption_classified_separately() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let good = raw_event_line(Venue::Binance, "btcusdt@trade", 100, r#"{"e":"trade"}"#);
+        // Bad line in the middle, followed by a good line.
+        write_file(
+            &session,
+            "binance",
+            "btcusdt_trade.0000.ndjson",
+            &[&good, "this is not json", &good],
+        );
+        let r = check_session(&sd, true).unwrap();
+        assert_eq!(r.structural.tail_truncated_files, 0);
+        assert_eq!(r.structural.interspersed_corrupt_files, 1);
+        assert!(r.details.iter().any(|d| d.kind == FindingKind::InterspersedCorrupt));
+    }
+
+    // -----------------------------------------------------------------
+    // v2: Binance bookTicker update_id monotonicity
+    // -----------------------------------------------------------------
+
+    fn book_ticker_payload(u: u64) -> String {
+        format!(
+            r#"{{"u":{u},"s":"BTCUSDT","b":"100","B":"1","a":"101","A":"1"}}"#
+        )
+    }
+
+    #[test]
+    fn binance_book_ticker_monotonic_passes() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 100, &book_ticker_payload(10)),
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 110, &book_ticker_payload(11)),
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 120, &book_ticker_payload(12)),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "binance", "btcusdt_bookTicker.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.binance_book_ticker_observed, 3);
+        assert_eq!(r.sequence.binance_book_ticker_update_id_breaks, 0);
+    }
+
+    #[test]
+    fn binance_book_ticker_regression_caught() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 100, &book_ticker_payload(10)),
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 110, &book_ticker_payload(8)), // regress
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "binance", "btcusdt_bookTicker.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.binance_book_ticker_observed, 2);
+        assert_eq!(r.sequence.binance_book_ticker_update_id_breaks, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // v2: Coinbase trade_id monotonicity
+    // -----------------------------------------------------------------
+
+    fn coinbase_payload(trade_ids: &[u64], kind: &str) -> String {
+        let trades = trade_ids
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"{{"trade_id":"{id}","product_id":"BTC-USD","side":"BUY","price":"100","size":"1","time":"2026-01-01T00:00:00Z"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"channel":"market_trades","sequence_num":1,"timestamp":"2026-01-01T00:00:00Z","events":[{{"type":"{kind}","trades":[{trades}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn coinbase_trade_id_monotonic_passes() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 100, &coinbase_payload(&[100, 101], "update")),
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 110, &coinbase_payload(&[102], "update")),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.coinbase_trade_id_observed, 3);
+        assert_eq!(r.sequence.coinbase_trade_id_breaks, 0);
+    }
+
+    #[test]
+    fn coinbase_trade_id_break_detected() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 100, &coinbase_payload(&[100], "update")),
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 110, &coinbase_payload(&[99], "update")), // regress
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.coinbase_trade_id_breaks, 1);
+    }
+
+    #[test]
+    fn coinbase_reverse_order_within_batch_is_not_a_break() {
+        // Coinbase emits trades newest-first within a single market_trades
+        // frame. Without sorting, [102, 101, 100] arriving in one frame
+        // would count as 2 breaks (101 < 102 and 100 < 101). After the
+        // intra-batch sort fix, the only thing that matters is that the
+        // batch's min is greater than the previous frame's max.
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [raw_event_line(
+            Venue::Coinbase,
+            "btc-usd@market_trades",
+            100,
+            &coinbase_payload(&[102, 101, 100], "update"),
+        )];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.coinbase_trade_id_breaks, 0);
+        assert_eq!(r.sequence.coinbase_trade_id_observed, 3);
+    }
+
+    #[test]
+    fn coinbase_cross_batch_break_still_caught_after_sort() {
+        // Sanity: the sort fix mustn't mask a real cross-batch regression.
+        // Frame 1: [200, 199, 198] (sorted -> 198,199,200). After: prev=200.
+        // Frame 2: [150, 149] (sorted -> 149,150).
+        //   First item 149 vs prev 200 -> break (entry becomes 149).
+        //   Second item 150 vs prev 149 -> monotonic, no break.
+        // So one cross-batch regression == one break. The magnitude of
+        // the gap (200 - 150 = 50 trades unaccounted for) isn't expressed
+        // by this counter; that's intentional — break-count is a signal,
+        // not a loss-quantification.
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 100,
+                           &coinbase_payload(&[200, 199, 198], "update")),
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 110,
+                           &coinbase_payload(&[150, 149], "update")),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.coinbase_trade_id_breaks, 1);
+    }
+
+    #[test]
+    fn coinbase_snapshot_resets_chain() {
+        // After a `snapshot` batch, trade_id state must be cleared so a
+        // post-reconnect resync doesn't trigger a spurious break.
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 100, &coinbase_payload(&[200, 201], "update")),
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 110, &coinbase_payload(&[100, 101], "snapshot")),
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 120, &coinbase_payload(&[102], "update")),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        // No break: the snapshot legitimately re-baselines the chain at
+        // 100, and 102 > 101 within the snapshot batch is fine, then
+        // 102 (the next update) > 101 is fine too.
+        assert_eq!(r.sequence.coinbase_trade_id_breaks, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // v2: verdict + safe replay cutoff
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verdict_pass_for_clean_session() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let line = raw_event_line(Venue::Binance, "btcusdt@trade", 100, r#"{"e":"trade","E":50,"T":50,"s":"BTCUSDT","t":1,"p":"100","q":"1","m":false}"#);
+        write_file(&session, "binance", "btcusdt_trade.0000.ndjson", &[&line]);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.verdict, "PASS");
+    }
+
+    #[test]
+    fn verdict_warn_for_tail_truncation() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let good = raw_event_line(Venue::Binance, "btcusdt@trade", 100, r#"{"e":"trade","E":50,"T":50,"s":"BTCUSDT","t":1,"p":"100","q":"1","m":false}"#);
+        write_file(&session, "binance", "btcusdt_trade.0000.ndjson", &[&good, "garbage"]);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.verdict, "WARN");
+        assert!(r.verdict_reason.contains("tail"));
+    }
+
+    #[test]
+    fn verdict_fail_for_interspersed_corruption() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let good = raw_event_line(Venue::Binance, "btcusdt@trade", 100, r#"{"e":"trade","E":50,"T":50,"s":"BTCUSDT","t":1,"p":"100","q":"1","m":false}"#);
+        write_file(&session, "binance", "btcusdt_trade.0000.ndjson", &[&good, "garbage", &good]);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.verdict, "FAIL");
+    }
+
+    #[test]
+    fn safe_cutoff_advances_for_clean_events_then_freezes() {
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 100, &book_ticker_payload(10)),
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 200, &book_ticker_payload(11)),
+            // Break here (8 < 11) → venue goes dirty after this event.
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 300, &book_ticker_payload(8)),
+            // Subsequent events should NOT advance the cutoff past 200.
+            raw_event_line(Venue::Binance, "btcusdt@bookTicker", 400, &book_ticker_payload(12)),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "binance", "btcusdt_bookTicker.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.verdict, "WARN");
+        let cutoff: u128 = r
+            .safe_replay_cutoff_ns
+            .get("binance")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(cutoff, 200, "cutoff should freeze at the last clean event");
     }
 }

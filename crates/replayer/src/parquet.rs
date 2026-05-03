@@ -248,6 +248,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(ts_ns),
             venue_ts_ms: vts_ms,
             payload: payload.into(),
+        ..Default::default()
         }
     }
 

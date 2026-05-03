@@ -64,6 +64,7 @@ fn ev(venue: Venue, stream: &str, ts_ns: u128, body: &str) -> RawEvent {
         local_ts_ns: LocalTimestamp::from_nanos(ts_ns),
         venue_ts_ms: None,
         payload: body.into(),
+    ..Default::default()
     }
 }
 
@@ -307,6 +308,7 @@ fn book_reconstructs_through_storage_replayer_decode_pipeline() {
                 &[("50000", "1"), ("49999", "2")],
                 &[("50001", "3"), ("50002", "4")],
             ),
+            ..Default::default()
         })
         .unwrap();
 
@@ -326,6 +328,7 @@ fn book_reconstructs_through_storage_replayer_decode_pipeline() {
                 local_ts_ns: LocalTimestamp::from_nanos(*ts),
                 venue_ts_ms: Some(*ts as i64 / 1_000_000),
                 payload: diff_payload(*ts as i64 / 1_000_000, *u_first, *u_final, bids, asks),
+                ..Default::default()
             })
             .unwrap();
     }
@@ -398,6 +401,7 @@ fn book_e2e_surfaces_gap_when_diff_chain_breaks() {
             local_ts_ns: LocalTimestamp::from_nanos(100),
             venue_ts_ms: None,
             payload: snapshot_payload(100, &[("100", "1")], &[("101", "1")]),
+            ..Default::default()
         })
         .unwrap();
     // First diff bridges the snapshot cleanly.
@@ -408,6 +412,7 @@ fn book_e2e_surfaces_gap_when_diff_chain_breaks() {
             local_ts_ns: LocalTimestamp::from_nanos(110),
             venue_ts_ms: None,
             payload: diff_payload(0, 101, 110, &[], &[]),
+            ..Default::default()
         })
         .unwrap();
     // Second diff jumps from u=110 expecting U=111, but we send U=200.
@@ -418,6 +423,7 @@ fn book_e2e_surfaces_gap_when_diff_chain_breaks() {
             local_ts_ns: LocalTimestamp::from_nanos(120),
             venue_ts_ms: None,
             payload: diff_payload(0, 200, 210, &[], &[]),
+            ..Default::default()
         })
         .unwrap();
     store.flush_all().unwrap();

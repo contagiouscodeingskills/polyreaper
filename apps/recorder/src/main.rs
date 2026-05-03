@@ -191,11 +191,16 @@ async fn main() -> ExitCode {
             return ExitCode::from(6);
         }
     };
-    let resolution_store = Arc::clone(&store);
+    // Resolution sweeper writes into the per-session sidecar
+    // <session>/_resolutions.ndjson. No longer takes a Store handle —
+    // resolutions are metadata about markets, not per-venue events, and
+    // a single sidecar avoids the per-slug 0-byte-file failure mode the
+    // original Store-backed sweeper hit during disk-pressure events.
+    let resolution_session_dir = session_dir_for_meta.clone();
     let resolution_handle = tokio::spawn(async move {
         sweep::run_resolution_sweep_loop(
             resolution_adapter,
-            resolution_store,
+            resolution_session_dir,
             Duration::from_secs(60),
         )
         .await

@@ -51,6 +51,7 @@ pub(crate) fn process_text(
         local_ts_ns: local_ts,
         venue_ts_ms: None,
         payload: payload.to_string(),
+        ..Default::default()
     };
 
     let store_t0 = std::time::Instant::now();

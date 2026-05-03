@@ -50,6 +50,7 @@ regex              = "1"
 rust_decimal       = { version = "1", features = ["serde", "serde-with-str"] }
 arrow              = { version = "53", default-features = false }
 parquet            = { version = "53", default-features = false, features = ["arrow", "snap"] }
+flate2             = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [profile.release]
 opt-level = 3

@@ -39,6 +39,9 @@ pub enum Command {
         verbose: bool,
         json: bool,
     },
+    ValidateResolutions {
+        root: PathBuf,
+    },
     Schema,
 }
 
@@ -62,13 +65,14 @@ USAGE:
     replayer <COMMAND> [OPTIONS]
 
 COMMANDS:
-    sessions    List sessions under --root
-    count       Count events matching the filter
-    head        Print the first -n events as NDJSON
-    tail        Print the last -n events as NDJSON
-    dump        Write filtered events to a Parquet file at --out
-    integrity   Check captured session(s) for data quality problems
-    schema      Print the Parquet export schema
+    sessions             List sessions under --root
+    count                Count events matching the filter
+    head                 Print the first -n events as NDJSON
+    tail                 Print the last -n events as NDJSON
+    dump                 Write filtered events to a Parquet file at --out
+    integrity            Check captured session(s) for data quality problems
+    validate-resolutions Verify resolution sidecar(s) are present + parseable
+    schema               Print the Parquet export schema
 
 OPTIONS:
     --root <PATH>          Session dir or base dir containing session_<UTC>/...
@@ -134,6 +138,9 @@ pub fn parse() -> Result<Command, CliError> {
             root: opts.require_root()?,
             verbose: opts.verbose,
             json: opts.json,
+        }),
+        "validate-resolutions" => Ok(Command::ValidateResolutions {
+            root: opts.require_root()?,
         }),
         "schema" => Ok(Command::Schema),
         "--help" | "-h" | "help" => {

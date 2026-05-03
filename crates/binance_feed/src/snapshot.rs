@@ -60,6 +60,7 @@ pub(crate) async fn fetch_and_persist(
         local_ts_ns: LocalTimestamp::now(),
         venue_ts_ms: None, // snapshot carries lastUpdateId, not a timestamp
         payload: body,
+        ..Default::default()
     };
 
     let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());

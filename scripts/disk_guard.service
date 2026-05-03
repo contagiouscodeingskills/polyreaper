@@ -1,0 +1,13 @@
+[Unit]
+Description=Polybot disk-pressure guard (oneshot)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/disk_guard.sh
+# Don't fail the unit if disk_guard exited 2 (dry-run "would act") or
+# 3/4 (acted). Only treat exit codes 1 (system error) and 10 (misuse)
+# as failures.
+SuccessExitStatus=2 3 4
+StandardOutput=journal
+StandardError=journal

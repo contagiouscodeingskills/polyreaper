@@ -128,6 +128,7 @@ mod tests {
             stream: stream.into(),
             bucket: 0,
             path: PathBuf::from("/dev/null"),
+            compressed: false,
         }
     }
 
@@ -138,6 +139,7 @@ mod tests {
             local_ts_ns: LocalTimestamp::from_nanos(ts),
             venue_ts_ms: None,
             payload: String::new(),
+        ..Default::default()
         }
     }
 
