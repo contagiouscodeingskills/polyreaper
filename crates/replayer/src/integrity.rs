@@ -529,6 +529,13 @@ pub fn check_session(
                             // resync and resets the chain; we treat it as
                             // a baseline and don't count breaks against
                             // events seen after it.
+                            //
+                            // Coinbase emits trades within a batch in
+                            // reverse-chronological order (newest first).
+                            // Walking them in receive order would falsely
+                            // flag every multi-trade frame as a break;
+                            // sort ascending before the monotonicity
+                            // check so we only see real cross-batch gaps.
                             let key = (event.venue, event.stream.clone());
                             let entry =
                                 coinbase_trade_id_state.entry(key).or_insert(None);
@@ -539,17 +546,22 @@ pub fn check_session(
                             if is_snapshot {
                                 *entry = None;
                             }
+                            let mut batch_ids: Vec<u64> = Vec::new();
                             for tr in cm.flatten() {
                                 report.sequence.coinbase_trade_id_observed += 1;
                                 if let Ok(id) = tr.trade_id.parse::<u64>() {
-                                    if let Some(prev) = *entry {
-                                        if id <= prev {
-                                            report.sequence.coinbase_trade_id_breaks += 1;
-                                            event_has_issue = true;
-                                        }
-                                    }
-                                    *entry = Some(id);
+                                    batch_ids.push(id);
                                 }
+                            }
+                            batch_ids.sort_unstable();
+                            for id in &batch_ids {
+                                if let Some(prev) = *entry {
+                                    if *id <= prev {
+                                        report.sequence.coinbase_trade_id_breaks += 1;
+                                        event_has_issue = true;
+                                    }
+                                }
+                                *entry = Some(*id);
                             }
                         }
                         Ok(_) => {}
@@ -1163,6 +1175,53 @@ mod tests {
         let lines = [
             raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 100, &coinbase_payload(&[100], "update")),
             raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 110, &coinbase_payload(&[99], "update")), // regress
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.coinbase_trade_id_breaks, 1);
+    }
+
+    #[test]
+    fn coinbase_reverse_order_within_batch_is_not_a_break() {
+        // Coinbase emits trades newest-first within a single market_trades
+        // frame. Without sorting, [102, 101, 100] arriving in one frame
+        // would count as 2 breaks (101 < 102 and 100 < 101). After the
+        // intra-batch sort fix, the only thing that matters is that the
+        // batch's min is greater than the previous frame's max.
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [raw_event_line(
+            Venue::Coinbase,
+            "btc-usd@market_trades",
+            100,
+            &coinbase_payload(&[102, 101, 100], "update"),
+        )];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);
+        let r = check_session(&sd, false).unwrap();
+        assert_eq!(r.sequence.coinbase_trade_id_breaks, 0);
+        assert_eq!(r.sequence.coinbase_trade_id_observed, 3);
+    }
+
+    #[test]
+    fn coinbase_cross_batch_break_still_caught_after_sort() {
+        // Sanity: the sort fix mustn't mask a real cross-batch regression.
+        // Frame 1: [200, 199, 198] (sorted -> 198,199,200). After: prev=200.
+        // Frame 2: [150, 149] (sorted -> 149,150).
+        //   First item 149 vs prev 200 -> break (entry becomes 149).
+        //   Second item 150 vs prev 149 -> monotonic, no break.
+        // So one cross-batch regression == one break. The magnitude of
+        // the gap (200 - 150 = 50 trades unaccounted for) isn't expressed
+        // by this counter; that's intentional — break-count is a signal,
+        // not a loss-quantification.
+        let tmp = TestDir::new();
+        let (session, sd) = make_session(tmp.path());
+        let lines = [
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 100,
+                           &coinbase_payload(&[200, 199, 198], "update")),
+            raw_event_line(Venue::Coinbase, "btc-usd@market_trades", 110,
+                           &coinbase_payload(&[150, 149], "update")),
         ];
         let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
         write_file(&session, "coinbase", "btc-usd_market_trades.0000.ndjson", &refs);

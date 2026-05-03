@@ -15,9 +15,15 @@ use crate::FeedStats;
 
 const RAW_LOG_TRUNCATE: usize = 256;
 
-/// Process a single inbound text frame. Never panics, never drops the
-/// payload silently: parse failures go to storage under a fallback stream
-/// name and bump `FeedStats.parse_failures`.
+/// Process a single inbound text frame. Never panics, never drops a
+/// market-data payload silently: parse failures go to storage under a
+/// fallback stream name and bump `FeedStats.parse_failures`.
+///
+/// Subscription acks (`{"result":...,"id":N}`) are the one thing that
+/// IS dropped — they're a control-channel echo of our own SUBSCRIBE
+/// frame, carry no market data, and previously cluttered the
+/// `_unrouted` file. We log the ack at info level so it's still
+/// inspectable in journald.
 pub(crate) fn process_text(
     payload: &str,
     cfg_streams: &[String],
@@ -25,6 +31,17 @@ pub(crate) fn process_text(
     stats: &FeedStats,
 ) {
     let local_ts = LocalTimestamp::now();
+
+    if is_subscribe_ack(payload) {
+        tracing::info!(
+            component = "binance_feed",
+            venue = "binance",
+            event = "subscribe_ack",
+            payload = %truncate(payload),
+            "subscribe acknowledged; dropping (not a market event)"
+        );
+        return;
+    }
 
     let (stream, venue_ts_ms) = match classify(payload) {
         Some(c) => {
@@ -136,6 +153,22 @@ fn is_book_ticker_shape(v: &serde_json::Value) -> bool {
         && v.get("A").and_then(|x| x.as_str()).is_some()
 }
 
+/// Recognise a Binance SUBSCRIBE ack. The recorder sends one SUBSCRIBE
+/// per connection with a fixed `id` field; Binance echoes the id back
+/// inside `{"result":null,"id":N}` (success) or `{"id":N,"result":[...]}`
+/// (failure). Acks have no `e` event-type field — that's how we
+/// differentiate from market events without a hard-coded id check.
+///
+/// A frame returning `true` here is a control-channel echo and should
+/// not be persisted to storage.
+fn is_subscribe_ack(payload: &str) -> bool {
+    let v: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    v.get("e").is_none() && v.get("id").is_some() && v.get("result").is_some()
+}
+
 /// Given a Binance event type, pick the matching entry from the config's
 /// subscribed streams. The mapping is intentionally narrow — unknown types
 /// return `None` so the caller can route to a fallback.
@@ -210,6 +243,40 @@ mod tests {
     fn classify_returns_none_for_subscribe_ack() {
         // Binance's SUBSCRIBE reply has no `"e"` field.
         assert!(classify(r#"{"result":null,"id":1}"#).is_none());
+    }
+
+    #[test]
+    fn is_subscribe_ack_recognises_success_payload() {
+        assert!(is_subscribe_ack(r#"{"result":null,"id":1}"#));
+    }
+
+    #[test]
+    fn is_subscribe_ack_recognises_failure_payload() {
+        // Binance returns the same shape with a non-null result on
+        // subscribe failures (e.g. unknown stream).
+        assert!(is_subscribe_ack(r#"{"id":1,"result":["unknown stream"]}"#));
+    }
+
+    #[test]
+    fn is_subscribe_ack_rejects_market_events() {
+        // Trade payload has `"e":"trade"` -> not an ack.
+        assert!(!is_subscribe_ack(
+            r#"{"e":"trade","E":1,"s":"BTCUSDT","t":1,"p":"100","q":"1","m":false,"T":1}"#
+        ));
+        // bookTicker has neither `e` nor `id` nor `result`.
+        assert!(!is_subscribe_ack(
+            r#"{"u":1,"s":"BTCUSDT","b":"100","B":"1","a":"101","A":"1"}"#
+        ));
+    }
+
+    #[test]
+    fn is_subscribe_ack_rejects_garbage() {
+        assert!(!is_subscribe_ack(""));
+        assert!(!is_subscribe_ack("not json"));
+        assert!(!is_subscribe_ack("{}"));
+        // Missing one of the required ack fields.
+        assert!(!is_subscribe_ack(r#"{"id":1}"#));
+        assert!(!is_subscribe_ack(r#"{"result":null}"#));
     }
 
     #[test]
