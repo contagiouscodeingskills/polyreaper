@@ -1,0 +1,307 @@
+# Session manifest — train / validation / holdout splits for OOS validation.
+#
+# Discipline: this file is the authoritative split. Holdout sessions MUST NOT
+# be used for parameter discovery, signal hunting, or any analysis that would
+# bias parameter choice. Train and validation sessions are fair game during
+# parameter discovery; holdout is touched only AFTER parameters are frozen.
+#
+# Inventory built from VPS metadata only (no strategy analysis was run).
+# VPS: 159.69.0.78, data dir /home/polybot/polybot/data
+# Inventory date: 2026-05-03
+
+schema_version = 1
+created_at = "2026-05-03"
+created_for = "Phase 3 OOS signal validation — Binance → Polymarket lag signal"
+
+[host]
+vps_host = "159.69.0.78"
+vps_data_dir = "/home/polybot/polybot/data"
+
+# ----------------------------------------------------------------------------
+# Splits
+# ----------------------------------------------------------------------------
+
+[splits]
+# Sessions previously used for signal discovery / parameter exploration.
+# These are quarantined from holdout forever.
+train = [
+  "session_20260426T122347Z",
+  "session_20260427T100216Z",
+]
+
+# Empty. The only candidate (session_20260502T071957Z) cannot be proven
+# untouched by lag/signal/OOS work to a sufficient standard — see its
+# per-session entry below. Conservative default per project policy:
+# leave validation empty rather than risk a contaminated tier.
+validation = []
+
+# Empty. Holdout is reserved for the freshest clean finalised-recorder
+# session. The current candidate is session_20260503T000248Z. It is NOT
+# yet promoted; promote only after ALL of these hold:
+#   - >= 48h of continuous capture without recorder restart
+#   - replayer integrity check returns PASS (T0/T1/T2 verdict)
+#   - last health snapshot reports write_failures = 0 across all feeds
+#   - no ENOSPC events recorded during the window
+#   - last health snapshot reports stalled = false across all feeds
+#   - chrony.available = true throughout the window
+holdout = []
+holdout_status = "pending"
+holdout_target_duration_hours = 48
+holdout_candidate = "session_20260503T000248Z"
+
+# ----------------------------------------------------------------------------
+# Per-session metadata (snapshot from VPS at 2026-05-03)
+# ----------------------------------------------------------------------------
+#
+# Field key:
+#   recorder_phase         — recorder build era inferred from sidecars present
+#   session_meta_present   — true iff _session_meta.json exists (from b7dfab6+)
+#   phase4_health_enrichment — true iff health snapshots include disk_free_bytes
+#   phase5_polymarket_batch  — true iff Polymarket events carry wire_batch_id
+#   integrity_status       — "pass" | "fail" | "warn" | "not_assessed"
+#   quality                — "usable" | "usable_pending_duration" | "damaged"
+#                            | "archival" | "fragment"
+
+# --- TRAIN ----------------------------------------------------------------
+
+[[sessions]]
+id = "session_20260426T122347Z"
+disk_size = "3.0G"
+feeds_present = ["binance", "chainlink", "coinbase", "polymarket"]
+recorder_phase = "pre-meta-sidecar"
+session_meta_present = false
+phase4_health_enrichment = false
+phase5_polymarket_batch = false
+integrity_status = "unknown"
+quality = "usable"
+split_assignment = "train"
+split_label = "discovery / 13h-gold-session / train-only"
+analysis_history = [
+  "scripts/lag_analysis.py",
+  "scripts/casestudy_analysis.py",
+  "scripts/scan_polymarket_swings.py",
+]
+notes = """
+The "13h gold session". Used for lag discovery — TRAIN ONLY, never
+eligible for validation or holdout. Per docs/polymarket_census.txt the
+polymarket subdir was 22G during census; on-disk size is now 3.0G
+(likely partial gzip / pruning). No formal replayer integrity result
+on record — integrity_status is "unknown" until one is published.
+"""
+
+[[sessions]]
+id = "session_20260427T100216Z"
+disk_size = "17G"
+feeds_present = ["binance", "coinbase", "polymarket"]
+recorder_phase = "priorities-1-5"
+session_meta_present = false
+phase4_health_enrichment = false
+phase5_polymarket_batch = false
+integrity_status = "unknown"
+quality = "usable"
+split_assignment = "train"
+split_label = "discovery / disk-full-era / recovered / train-only"
+analysis_history = [
+  "scripts/lag_analysis_v2.py",
+  "scripts/lag_analysis_v3.py",
+  "scripts/integrity_supplementary.py",
+  "scripts/lag_run_confirm.py",
+]
+notes = """
+Priorities 1-5 era recorder. TRAIN ONLY — not clean holdout-quality.
+The last line of _health.ndjson is truncated mid-JSON, indicating a
+non-clean shutdown consistent with the "recovered disk-full session".
+docs/NEXT_SESSION.md mentions a clean replayer-integrity run on this
+session at hand-off time; that note is informational only and is NOT
+treated here as a formal integrity result. integrity_status remains
+"unknown" until a fresh PASS verdict is recorded against this manifest.
+Used for lag discovery via lag_analysis_v2/v3, lag_run_confirm, and
+integrity_supplementary.
+"""
+
+# --- UNASSIGNED (provenance unproven) -------------------------------------
+
+[[sessions]]
+id = "session_20260502T071957Z"
+disk_size = "15G"
+feeds_present = ["binance", "coinbase", "polymarket"]
+recorder_phase = "post-meta-sidecar / pre-phase-4"
+session_meta_present = true
+recorder_version = "0.1.0"
+phase4_health_enrichment = false
+phase5_polymarket_batch = false
+integrity_status = "unknown"
+quality = "usable_unassigned"
+split_assignment = "none"
+split_label = "untouched-as-far-as-verified / not-yet-promoted"
+duration_hours = 15.7
+analysis_history = []
+last_snapshot_counters = { binance_messages = 3780940, polymarket_messages = 14900940, coinbase_messages = 72291, write_failures = 0, polymarket_reconnects = 4, binance_parse_failures = 1 }
+notes = """
+First session with _session_meta.json sidecar. 15.7h continuous capture,
+0 write failures, 4 polymarket reconnects, 1 binance parse failure —
+data-quality counters look clean. Pre-phase-4 (no disk_free_bytes in
+health) and pre-phase-5 (no wire_batch_id in Polymarket events).
+
+Provenance verification (2026-05-03 inventory): all persistent lag
+analysis scripts (in /tmp on the VPS and in scripts/ in the repo)
+target only the two known training sessions; no analysis output files
+reference this session; no analysis artifacts were written into the
+session directory; no git history mentions; bash history files exist
+but contain no relevant entries. This is strong evidence of
+non-contamination, but not positive proof — bash history being empty
+could equally mean nothing was run OR that history was cleared.
+
+Per project policy ("if there is any doubt, leave validation empty"),
+this session is left UNASSIGNED. It is not in train, validation, or
+holdout. Promotion path: a fresh provenance audit + an integrity PASS
++ explicit user approval to assign it to validation or holdout.
+"""
+
+# --- HOLDOUT CANDIDATE (PENDING) -----------------------------------------
+
+[[sessions]]
+id = "session_20260503T000248Z"
+disk_size = "11G+"
+feeds_present = ["binance", "coinbase", "polymarket"]
+recorder_phase = "phase-5+"
+session_meta_present = true
+recorder_version = "0.1.0"
+phase4_health_enrichment = true
+phase5_polymarket_batch = true
+integrity_status = "unknown"
+quality = "usable_pending_duration"
+split_assignment = "holdout_candidate"
+split_label = "holdout candidate (pending duration + integrity gates)"
+recorder_active_at_inventory = true
+duration_hours_at_inventory = 9.7
+analysis_history = []
+last_snapshot_counters = { binance_messages = 2465148, polymarket_messages = 10357187, coinbase_messages = 51870, write_failures = 0, reconnects = 0, stalled_any = false, chrony_available = true, disk_free_bytes = 16107442176 }
+resolutions_at_inventory = 617
+notes = """
+Live finalised-recorder session. Currently still capturing (recorder
+service polybot-recorder reported active at inventory time). All
+data-quality counters in the latest health snapshot are clean; phase 4
+and phase 5 markers are present. integrity_status is "unknown" until a
+formal replayer integrity run is published. Marked as holdout_candidate
+only — NOT in splits.holdout. Promote to splits.holdout only after the
+explicit gates listed at the top of this file are satisfied.
+"""
+
+# --- ARCHIVAL / FRAGMENT (excluded from splits) ---------------------------
+
+[[sessions]]
+id = "session_20260502T230330Z"
+disk_size = "1.1G"
+feeds_present = ["binance", "coinbase", "polymarket"]
+recorder_phase = "phase-5+"
+session_meta_present = true
+phase4_health_enrichment = true
+phase5_polymarket_batch = true
+integrity_status = "unknown"
+quality = "archival"
+duration_minutes = 57
+last_snapshot_counters = { binance_messages = 204991, polymarket_messages = 1017774, coinbase_messages = 10156, write_failures = 0, reconnects = 0, stalled_any = false, disk_free_bytes = 27230851072 }
+resolutions = 512
+notes = "First post-phase-5 session. Only ~57 minutes before restart. Too short for analysis; kept for posterity."
+
+[[sessions]]
+id = "session_20260502T062624Z"
+disk_size = "888M"
+feeds_present = ["binance", "coinbase", "polymarket"]
+recorder_phase = "pre-phase-4"
+session_meta_present = false
+phase4_health_enrichment = false
+phase5_polymarket_batch = false
+integrity_status = "unknown"
+quality = "archival"
+duration_minutes = 53
+last_snapshot_counters = { binance_messages = 150123, polymarket_messages = 905117, coinbase_messages = 4557, write_failures = 0, reconnects = 0 }
+notes = "53-minute restart fragment immediately preceding session_20260502T071957Z."
+
+[[sessions]]
+id = "session_20260427T095441Z"
+disk_size = "216M"
+feeds_present = ["binance", "chainlink", "coinbase", "polymarket"]
+recorder_phase = "pre-meta-sidecar"
+session_meta_present = false
+phase4_health_enrichment = false
+phase5_polymarket_batch = false
+integrity_status = "unknown"
+quality = "fragment"
+duration_minutes = 7
+notes = "7-minute restart fragment immediately preceding session_20260427T100216Z."
+
+[[sessions]]
+id = "session_20260426T115447Z"
+disk_size = "588M"
+feeds_present = ["binance", "chainlink", "coinbase", "polymarket"]
+recorder_phase = "pre-meta-sidecar"
+session_meta_present = false
+phase4_health_enrichment = false
+phase5_polymarket_batch = false
+integrity_status = "unknown"
+quality = "archival"
+notes = "Short session immediately preceding the 13h gold session. No health output."
+
+[[sessions]]
+id = "session_20260425T055303Z"
+disk_size = "4.6G"
+feeds_present = ["binance", "chainlink", "coinbase", "polymarket"]
+recorder_phase = "pre-meta-sidecar"
+session_meta_present = false
+phase4_health_enrichment = false
+phase5_polymarket_batch = false
+integrity_status = "unknown"
+quality = "archival"
+notes = "Substantial pre-meta-sidecar dev session. No health output. Could be reanalysed if more discovery data is needed; currently unused."
+
+[[sessions]]
+id = "session_20260425T053013Z"
+disk_size = "19M"
+integrity_status = "unknown"
+quality = "fragment"
+
+[[sessions]]
+id = "session_20260425T052848Z"
+integrity_status = "unknown"
+quality = "fragment"
+
+[[sessions]]
+id = "session_20260425T052510Z"
+integrity_status = "unknown"
+quality = "fragment"
+
+[[sessions]]
+id = "session_20260425T052100Z"
+integrity_status = "unknown"
+quality = "fragment"
+
+[[sessions]]
+id = "session_20260425T045622Z"
+integrity_status = "unknown"
+quality = "fragment"
+
+[[sessions]]
+id = "session_20260425T044344Z"
+integrity_status = "unknown"
+quality = "fragment"
+
+# ----------------------------------------------------------------------------
+# Open inventory gaps to address before relying on this manifest
+# ----------------------------------------------------------------------------
+#
+# 1. Recorder git rev not in _session_meta.json. The schema has
+#    recorder_version (static "0.1.0") but no git_rev field. Add one in the
+#    next recorder commit so future sessions self-identify their build.
+# 2. integrity_status = "unknown" on every session. A formal replayer
+#    integrity run must be executed and the verdict recorded against
+#    this manifest before any session is relied on for analysis. Run
+#    `replayer integrity --root <session>` on each session in train,
+#    validation, holdout, or holdout_candidate, and update the
+#    integrity_status field with the verdict (PASS / WARN / FAIL).
+#    Metadata-derived inference of integrity is not permitted.
+# 3. ENOSPC and write_failures are reported per-snapshot as cumulative
+#    counters. The truncated last health line of session_20260427T100216Z
+#    means we cannot read its final write_failures; recovery from the
+#    body of the file is possible but not done here.

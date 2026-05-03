@@ -1,0 +1,95 @@
+# Frozen BASELINE parameters for the Binance → Polymarket lag-signal OOS
+# validation.
+#
+# These are NOT claimed to be optimal parameters. They are the values
+# inherited from prior discovery work on the train sessions in
+# manifests/sessions.toml — fixed reference points, not the best-known
+# settings. The OOS exercise tests whether the signal survives at these
+# baseline values; it does NOT search for better ones.
+#
+# Hard rules enforced by this file:
+#   - No parameter sweep is permitted using these values as a search
+#     centre on holdout data.
+#   - No holdout tuning. Holdout sessions must be evaluated with these
+#     values exactly and the result accepted, even if it is poor.
+#   - Any change to a parameter below requires bumping the schema_version
+#     and re-running on validation (where validation is non-empty), then
+#     re-freezing before another holdout pass.
+#
+# Reproduce the holdout report by passing this file to scripts/lag_oos.py
+# (to be built) and running it against the holdout split as defined in
+# manifests/sessions.toml.
+
+schema_version = 1
+hypothesis = "Binance → Polymarket lag: directional Binance moves precede Polymarket repricing"
+frozen_at = "2026-05-03"
+parameter_status = "frozen-baseline-not-optimal"
+sweep_permitted = false
+holdout_tuning_permitted = false
+frozen_against_sessions = [
+  "session_20260426T122347Z",
+  "session_20260427T100216Z",
+]
+
+# ----------------------------------------------------------------------------
+# Polymarket market filter: which markets we count
+# ----------------------------------------------------------------------------
+
+[odds_band]
+# Restrict to mid-band markets where directional signal is meaningful.
+# Outside this band the market is near-resolved and the dynamics differ.
+yes_mid_min = 0.30
+yes_mid_max = 0.70
+
+[filters]
+# Optional sanity filter. Spread above this is treated as untradeable
+# microstructure and the row is excluded from the response measurement.
+# Treated as an upper bound; not a tunable parameter for OOS.
+spread_max = 0.05
+
+# ----------------------------------------------------------------------------
+# Binance side: defining a "move"
+# ----------------------------------------------------------------------------
+
+[binance_move]
+# Detect directional Binance moves at these bps thresholds (basis points
+# of mid). Each threshold is reported side-by-side; this is NOT a sweep
+# we optimise over and we do not pick a "winning" threshold from the
+# holdout result.
+thresholds_bps = [5, 10, 20]
+
+# Window over which the bps move must accumulate to count.
+move_window_seconds = 20
+
+# ----------------------------------------------------------------------------
+# Polymarket side: measuring the response
+# ----------------------------------------------------------------------------
+
+[response]
+# Window after a Binance move in which we look for Polymarket repricing.
+# Same-direction within this window → "responded". Opposite-direction →
+# "opposite". No movement above noise threshold → "no-response".
+response_window_seconds = 30
+
+# ----------------------------------------------------------------------------
+# Market lifecycle: avoid endgame
+# ----------------------------------------------------------------------------
+
+[market_lifecycle]
+# Drop the last N seconds before market resolution. Endgame liquidity,
+# auto-flatten flow, and settlement front-running distort the response
+# distribution and are out of scope for the lag hypothesis.
+exclude_last_seconds = 30
+
+# ----------------------------------------------------------------------------
+# What this file deliberately does NOT contain
+# ----------------------------------------------------------------------------
+#
+# - No P&L or EV parameters. Phase 3 measures lag/response statistics
+#   only; economic metrics are introduced in Phase 4 (execution simulator).
+# - No fill, slippage, or fee model.
+# - No size or position sizing.
+# - No threshold sweep over the Binance bps values. Each threshold is
+#   reported as a separate line; none is selected as "best".
+# - No holdout-tuned override of any field below. Holdout is run once
+#   against the baseline and the result is accepted as-is.
