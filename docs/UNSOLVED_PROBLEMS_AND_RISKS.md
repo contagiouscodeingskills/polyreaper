@@ -709,7 +709,103 @@ Last consolidated: 2026-05-03.
 
 ---
 
-## 13. Open Questions
+## 13. Reproducibility / Provenance
+
+### PRV-001 · No immutable experiment provenance standard yet
+- **Area**: Reproducibility
+- **Severity**: HIGH
+- **Status**: OPEN
+- **Description**: Analyses capture partial provenance (frozen params file, manifest sessions, scripts in git) but there is no documented standard for what every run MUST emit: input manifest hash, params hash, code git rev + dirty flag, dataset hashes, output artifact path, runtime. Without it, two runs of the "same" script can silently differ.
+- **Evidence / source**: No `docs/REPRODUCIBILITY_AND_EXPERIMENT_STANDARD.md`; analysis scripts hardcode `SESSION_DIR`; output paths in `/tmp/lag_*_summary.json` are ad-hoc.
+- **How to detect**: Pick any `/tmp/lag_*_summary.json` on VPS; ask whether it can be regenerated bit-for-bit from inputs alone. It cannot today.
+- **Proposed fix**: Define standard (Part 5 of operating-system plan). Each run writes an `experiment.json` with: `git_rev`, `git_dirty`, manifest path + sha256, params path + sha256, command line, host, start/end timestamps, output paths, runtime stats.
+- **Blocks live trading?** NO directly; blocks confidence in any backtest / shadow result.
+- **Next action**: Define in `docs/REPRODUCIBILITY_AND_EXPERIMENT_STANDARD.md` (Part 5, spec pending from user).
+
+### PRV-002 · No formal minimum sample-size / confidence-interval standard
+- **Area**: Reproducibility / statistics
+- **Severity**: HIGH
+- **Status**: OPEN
+- **Description**: No project-wide rule for minimum sample size per slice or how confidence intervals are computed and reported. An OOS result claiming "lag signal exists" could be drawn from N=20 events without flagging.
+- **Evidence / source**: `configs/lag_oos_baseline.toml` reports counts per slice but specifies no minimum N; no CI methodology defined anywhere.
+- **How to detect**: Read any analysis script; CI is inconsistent or absent.
+- **Proposed fix**: Define minimum N per metric per slice; pick a CI method (bootstrap / Wilson / Clopper-Pearson); enforce in OOS scripts.
+- **Blocks live trading?** NO directly; blocks credibility of OOS verdict.
+- **Next action**: Define in standard (Part 5/6).
+
+### PRV-003 · No multiple-testing / overfitting control standard
+- **Area**: Reproducibility / statistics
+- **Severity**: HIGH
+- **Status**: OPEN
+- **Description**: Three Binance bps thresholds × multiple odds bands × multiple time windows produces many slices. No correction for multiple testing; even with the holdout discipline, overfitting risk to discovery sessions is non-zero (parameter selection happened on those sessions).
+- **Evidence / source**: No correction in any analysis script; no documented policy.
+- **How to detect**: Read analysis scripts; absent.
+- **Proposed fix**: Define policy: Bonferroni / Holm / FDR for the family of slices; document which tests are in the family. Pre-register the family before holdout evaluation.
+- **Blocks live trading?** NO directly; biases OOS verdict toward false-positive.
+- **Next action**: Define in standard (Part 5/6).
+
+### PRV-004 · No numeric promotion gates from OOS → simulator → shadow → live
+- **Area**: Reproducibility / promotion gates
+- **Severity**: BLOCKER (process)
+- **Status**: OPEN
+- **Description**: Architecture doc names the phases but does not give numeric thresholds (e.g., "OOS holdout same-direction rate ≥ X% with 95% CI lower bound > 50% on minimum N events per slice"). Without numbers, "review and approve" is subjective and movable post-hoc.
+- **Evidence / source**: `docs/BOT_ARCHITECTURE_AND_BUILD_PLAN.md` build-order section; no numbers.
+- **How to detect**: Read the build-order section.
+- **Proposed fix**: Define numeric gates per transition (Part 7 of operating-system plan, pending user spec).
+- **Blocks live trading?** YES (without gates, the live decision is ad-hoc).
+- **Next action**: Define in promotion-gate standard (Part 7, pending user spec).
+
+### PRV-005 · No artifact / log / report retention policy
+- **Area**: Reproducibility / ops
+- **Severity**: MEDIUM
+- **Status**: OPEN
+- **Description**: Analysis outputs land in `/tmp` on the VPS, in `scripts/` locally, and as untracked summary files. No retention rule (how long to keep, what to commit, what to gzip, what to delete). Risks: losing reproducibility evidence on `/tmp` reboot; disk fill from accumulated outputs; uncertainty about which artifact is "current".
+- **Evidence / source**: `/tmp/lag_*.{py,json,txt,log}` on VPS; untracked outputs locally.
+- **How to detect**: `ls /tmp` on VPS; observe ad-hoc paths.
+- **Proposed fix**: Standard: every experiment writes to `experiments/<run_id>/`; committable artifacts go in a tracked `experiments/` subtree; raw data stays out of git; retention windows for VPS `/tmp` defined.
+- **Blocks live trading?** NO directly.
+- **Next action**: Define in standard (Part 5).
+
+---
+
+## 14. Claude / Automation Workflow
+
+### WRK-001 · No runner / secrets / approval-boundary document
+- **Area**: Workflow / security
+- **Severity**: HIGH
+- **Status**: OPEN
+- **Description**: No doc spells out: which user runs what (root vs polybot), where secrets live (none today, but wallet keys will need a home), what approval each action class requires (e.g., Risk Engine config change vs strategy code change vs deploy). Without it, scope creep into wallet / live execution is too easy.
+- **Evidence / source**: No such doc.
+- **How to detect**: N/A (absence).
+- **Proposed fix**: Initial coverage in `docs/CLAUDE_UNATTENDED_WORK_RULES.md` (Part 4); fuller treatment in a `docs/RUNNERS_AND_SECRETS.md` later.
+- **Blocks live trading?** YES (wallet / secrets without a clear policy is a hazard).
+- **Next action**: Cover the runner/approval-class part in Part 4 of this round.
+
+### WRK-002 · No failure-injection drill checklist
+- **Area**: Workflow / verification
+- **Severity**: MEDIUM
+- **Status**: OPEN
+- **Description**: We have not exercised: feed stall, ENOSPC, kill -9 of recorder, network partition, chrony loss, Polymarket Gamma 5xx. Each is something the recorder / replayer / future risk engine should handle gracefully; until exercised, we don't know what does. Cross-references REC-003, REC-007, STO-001, STO-002, RES-001.
+- **Evidence / source**: User-listed; multiple "not tested" items in §1, §2, §5.
+- **How to detect**: N/A (absence of checklist).
+- **Proposed fix**: Maintain a drills checklist with pass/fail status and reproduction commands. Run drills periodically (frequency tracked here).
+- **Blocks live trading?** NO directly; gates confidence in shadow / live readiness.
+- **Next action**: Draft alongside testing/verification standard (Part 6, spec pending).
+
+### WRK-003 · No formal unattended Claude work rules
+- **Area**: Workflow
+- **Severity**: HIGH
+- **Status**: IN PROGRESS (Part 4 of this round)
+- **Description**: Until `docs/CLAUDE_UNATTENDED_WORK_RULES.md` exists, an unattended Claude run has no documented policy on what it may / may not do, when to stop, what to commit, and what to escalate.
+- **Evidence / source**: No such file (yet).
+- **How to detect**: `ls docs/`.
+- **Proposed fix**: Create `docs/CLAUDE_UNATTENDED_WORK_RULES.md` (Part 4, in progress).
+- **Blocks live trading?** YES (must exist before any unattended work goes near live).
+- **Next action**: Land Part 4 of this round.
+
+---
+
+## 15. Open Questions
 
 (Originally `docs/BOT_ARCHITECTURE_AND_BUILD_PLAN.md` §"Open questions". Consolidated here.)
 
@@ -752,7 +848,7 @@ Last consolidated: 2026-05-03.
 
 ---
 
-## 14. Archived / Accepted Risks
+## 16. Archived / Accepted Risks
 
 (Items that are real, tracked, but explicitly accepted at the current phase. Mostly carried in from `docs/TECH_DEBT.md` and `docs/decisions.md`. Re-evaluate triggers are listed where relevant.)
 
@@ -777,7 +873,7 @@ Last consolidated: 2026-05-03.
 This file pulls from:
 - `docs/TECH_DEBT.md` — 5 deferred items (now ARC items above)
 - `docs/NEXT_SESSION.md` — 5 open tasks + 2 carry-overs (now in §1, §2, §5, §11, §12)
-- `docs/BOT_ARCHITECTURE_AND_BUILD_PLAN.md` — Open Questions (§13) + per-system "what could go wrong" notes
+- `docs/BOT_ARCHITECTURE_AND_BUILD_PLAN.md` — Open Questions (§15) + per-system "what could go wrong" notes
 - `docs/decisions.md` — accepted-design items (RES-002, REC-008 framing)
 - `configs/recorder.toml` line 32 — Polymarket WS TODO (REC-005)
 - `crates/config/src/lib.rs` line 91 — same TODO (REC-005)
