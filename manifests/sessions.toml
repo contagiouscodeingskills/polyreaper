@@ -72,7 +72,14 @@ recorder_phase = "pre-meta-sidecar"
 session_meta_present = false
 phase4_health_enrichment = false
 phase5_polymarket_batch = false
-integrity_status = "unknown"
+integrity_status = "WARN"
+integrity_status_source = "docs/research/integrity/2026-05-10-train-integrity.md"
+integrity_status_recorded_at = "2026-05-10"
+integrity_warn_reasons = [
+  "polymarket_ts_violations",
+  "coinbase_trade_id_breaks",
+  "polymarket_hash_consecutive_duplicates",
+]
 quality = "usable"
 split_assignment = "train"
 split_label = "discovery / 13h-gold-session / train-only"
@@ -85,8 +92,12 @@ notes = """
 The "13h gold session". Used for lag discovery — TRAIN ONLY, never
 eligible for validation or holdout. Per docs/polymarket_census.txt the
 polymarket subdir was 22G during census; on-disk size is now 3.0G
-(likely partial gzip / pruning). No formal replayer integrity result
-on record — integrity_status is "unknown" until one is published.
+(likely partial gzip / pruning). Formal replayer-integrity verdict
+WARN recorded 2026-05-10: 0 interspersed corruption, 0 parse errors,
+0 decode errors, 0 Binance depth-chain breaks, 0 bookTicker breaks;
+WARN driven by venue-side informational counters (13,053 Polymarket
+per-asset ts violations, 18 Coinbase trade_id breaks out of 412,659,
+4,550,615 consecutive Polymarket hash duplicates). Safe for TRAIN use.
 """
 
 [[sessions]]
@@ -97,7 +108,16 @@ recorder_phase = "priorities-1-5"
 session_meta_present = false
 phase4_health_enrichment = false
 phase5_polymarket_batch = false
-integrity_status = "unknown"
+integrity_status = "WARN"
+integrity_status_source = "docs/research/integrity/2026-05-10-train-integrity.md"
+integrity_status_recorded_at = "2026-05-10"
+integrity_warn_reasons = [
+  "tail_truncated_files_post_cutoff",
+  "polymarket_ts_violations",
+  "coinbase_trade_id_breaks",
+  "polymarket_hash_consecutive_duplicates",
+]
+integrity_safe_replay_cutoff_ns = { binance = "1777523971736139791", coinbase = "1777302287334703671", polymarket = "1777284136960309700" }
 quality = "usable"
 split_assignment = "train"
 split_label = "discovery / disk-full-era / recovered / train-only"
@@ -111,12 +131,17 @@ notes = """
 Priorities 1-5 era recorder. TRAIN ONLY — not clean holdout-quality.
 The last line of _health.ndjson is truncated mid-JSON, indicating a
 non-clean shutdown consistent with the "recovered disk-full session".
-docs/NEXT_SESSION.md mentions a clean replayer-integrity run on this
-session at hand-off time; that note is informational only and is NOT
-treated here as a formal integrity result. integrity_status remains
-"unknown" until a fresh PASS verdict is recorded against this manifest.
-Used for lag discovery via lag_analysis_v2/v3, lag_run_confirm, and
-integrity_supplementary.
+Formal replayer-integrity verdict WARN recorded 2026-05-10: 249
+tail-truncated polymarket .ndjson.gz files (all post-cutoff,
+recoverable; replay stops at last valid line), 0 interspersed
+corruption, 0 decode errors, 28 Binance depth-chain breaks vs 49
+snapshots (within expected reconnect/refresh range), 0 bookTicker
+breaks, 5,133 Polymarket per-asset ts violations (informational),
+6 Coinbase trade_id breaks (0.0025%), 2,198,696 consecutive
+Polymarket hash duplicates (informational). Binance safe-cutoff
+1777523971736139791 ns matches CUTOFF_NS in lag_analysis_v2.py:40.
+Pre-cutoff data is clean; post-cutoff confined to known tail
+truncations. Safe for TRAIN use within cutoff.
 """
 
 # --- UNASSIGNED (provenance unproven) -------------------------------------
