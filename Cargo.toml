@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "apps/bot",
     "apps/recorder",
     "apps/replayer",
     "crates/common",

@@ -1,0 +1,80 @@
+# PolyBot trading bot — paper-mode v0 config.
+#
+# Defaults match `BotConfig::default()` in `apps/bot/src/config.rs`. Tweak
+# here per session; CLI override comes later.
+
+mode = "paper"
+
+[strategy]
+# Minimum |FV - poly_mid| (probability units) before a signal fires.
+# Must cover fees + spread + edge_threshold.
+min_edge = 0.02
+
+# Edge magnitude (prob units) at which sizing reaches max. Linear ramp
+# between min_edge and edge_scale.
+edge_scale = 0.08
+
+# Refuse to trade when time-to-resolution is below this (seconds). Avoids
+# the freeze window and seconds where settlement is essentially certain.
+min_ttr_secs = 15.0
+
+# Rolling window (seconds) for realised-vol estimation from Binance mids.
+vol_window_secs = 60.0
+
+# Fallback σ-per-second when the vol window hasn't filled yet. BTC
+# annualised vol ~50% → per-second ~3.5e-5; we use a slightly conservative
+# default.
+fallback_sigma_per_sec = 5.0e-5
+
+[risk]
+# Max USD spent on a single trade. v0 paper starts at $1.
+max_per_trade_usd = 1.0
+
+# Max cumulative USD cost basis on a single market. Caps total exposure
+# even when many small fills would otherwise stack up. Clips the order
+# size if partial headroom remains; rejects when at cap.
+max_notional_per_market_usd = 5.0
+
+# If realised + unrealised loss on a single market reaches this (USD), the
+# kill switch trips — no further orders on that market this run.
+max_loss_per_market_usd = 5.0
+
+# Minimum seconds between consecutive fills on the same market. Defends
+# against firing every tick when Polymarket hasn't yet repriced — without
+# this, a sticky edge would spam orders.
+min_secs_between_fires_per_market = 2.0
+
+# Cap on concurrently-open positions across markets. v0 = 1 (one market
+# at a time) until we trust the wire.
+max_concurrent_positions = 1
+
+# ---------------------------------------------------------------------------
+# Feed endpoints. Public read-only — no secrets here. Live order placement
+# (when added) will use a separate, gitignored auth section.
+# ---------------------------------------------------------------------------
+
+[feeds.binance]
+# Single-stream URL form. Wire format is the bookTicker JSON; no SUBSCRIBE
+# message required because the stream is in the path.
+ws_url = "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
+# Reconnect if no inbound text frame for this many seconds.
+read_idle_secs = 30
+
+[feeds.polymarket]
+# CLOB REST base. The bot polls `/book?token_id=...` against this.
+clob_url = "https://clob.polymarket.com"
+# How often we re-poll the book for the active market (ms). 500ms is well
+# below Polymarket's 2-4s typical repricing window, so we won't miss the
+# edge window. Tighten only if the strategy needs it; loosen if we're
+# rate-limited.
+book_poll_ms = 500
+
+[feeds.gamma]
+# Polymarket Gamma /events endpoint — used for market discovery.
+url = "https://gamma-api.polymarket.com/events"
+# How often we re-discover the active market. 15s is fine for 5m markets;
+# they only roll over every ~5 min.
+poll_interval_secs = 15
+# Series slug — locks the bot to the BTC 5m up/down series. Don't change
+# without also reviewing strike/TTR logic, which assumes BTC up/down.
+series_slug = "btc-up-or-down-5m"

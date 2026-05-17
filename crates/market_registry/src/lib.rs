@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 pub const NAME: &str = "market_registry";
 
 pub mod gamma;
@@ -25,7 +27,8 @@ pub use gamma::GammaAdapter;
 
 /// Opaque Polymarket market identifier. Expected to hold `condition_id` in
 /// practice, but we do not commit to that naming in this crate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct MarketId(String);
 
 impl MarketId {
@@ -44,7 +47,8 @@ impl std::fmt::Display for MarketId {
 }
 
 /// Opaque CLOB token identifier (one per Yes/No side per market).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TokenId(String);
 
 impl TokenId {
@@ -67,7 +71,8 @@ impl std::fmt::Display for TokenId {
 // ---------------------------------------------------------------------------
 
 /// Which side of a binary market won at resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Yes,
     No,
