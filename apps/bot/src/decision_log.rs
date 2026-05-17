@@ -23,7 +23,7 @@ use crate::config::BotConfig;
 use crate::risk::RejectReason;
 use crate::strategy::NoSignalReason;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Record
@@ -62,10 +62,29 @@ pub struct DecisionRecord {
     pub poly_yes_bid: Option<f64>,
     pub poly_yes_ask: Option<f64>,
     pub poly_yes_mid: Option<f64>,
+    pub poly_yes_bid_size: Option<f64>,
+    pub poly_yes_ask_size: Option<f64>,
+    pub poly_yes_spread: Option<f64>,
     pub poly_no_bid: Option<f64>,
     pub poly_no_ask: Option<f64>,
     pub poly_no_mid: Option<f64>,
+    pub poly_no_bid_size: Option<f64>,
+    pub poly_no_ask_size: Option<f64>,
+    pub poly_no_spread: Option<f64>,
     pub poly_book_age_ms: Option<f64>,
+
+    // Binance microstructure — multi-window log returns and realized σ
+    pub btc_log_return_5s: Option<f64>,
+    pub btc_log_return_30s: Option<f64>,
+    pub btc_log_return_60s: Option<f64>,
+    pub btc_log_return_300s: Option<f64>,
+    pub sigma_per_sec_5s: Option<f64>,
+    pub sigma_per_sec_30s: Option<f64>,
+    pub sigma_per_sec_60s: Option<f64>,
+    pub sigma_per_sec_300s: Option<f64>,
+
+    // Time-bucket label derived from ttr_secs at write time.
+    pub time_bucket: Option<String>,
 
     // Cross-venue strike diagnostics (the open question — see memory
     // entry "Cross-venue strike open question").
@@ -238,63 +257,44 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_record_through_serde_json() {
-        let r = DecisionRecord {
-            schema_version: SCHEMA_VERSION,
-            local_ts_ns: "1779008700123456789".into(),
-            session_id: "bot_session_20260517T090000Z".into(),
-            bot_version: BOT_VERSION.into(),
-            market_id: "0xabc".into(),
-            market_slug: "btc-updown-5m-1779008700".into(),
-            yes_token: "y".into(),
-            no_token: "n".into(),
-            end_epoch: 1_779_009_000,
-            effective_start_epoch: 1_779_008_700,
-            ttr_secs: 280.0,
-            binance_btc_mid_usd: Some(78_089.79),
-            binance_strike_usd: Some(78_089.79),
-            btc_last_update_age_ms: Some(100.0),
-            btc_history_len: 1000,
-            poly_yes_bid: Some(0.33),
-            poly_yes_ask: Some(0.35),
-            poly_yes_mid: Some(0.34),
-            poly_no_bid: Some(0.65),
-            poly_no_ask: Some(0.67),
-            poly_no_mid: Some(0.66),
-            poly_book_age_ms: Some(50.0),
-            implied_strike_usd: Some(78_117.0),
-            strike_gap_usd: Some(27.21),
-            strike_gap_bps: Some(3.48),
-            sigma_per_sec_used: Some(5.0e-5),
-            sigma_source: Some("fallback".into()),
-            vol_samples: 500,
-            fv_yes: Some(0.50),
-            fv_no: Some(0.50),
-            edge_yes: Some(0.16),
-            decision_kind: DecisionKind::Fire,
-            decision_side: Some("yes".into()),
-            decision_size_usd: Some(1.0),
-            decision_price: Some(0.34),
-            no_signal_reason: None,
-            reject_reason: None,
-            incomplete_reason: None,
-        };
-        let line = serde_json::to_string(&r).unwrap();
-        let parsed: DecisionRecord = serde_json::from_str(&line).unwrap();
-        assert_eq!(parsed.market_id, r.market_id);
-        assert_eq!(parsed.decision_kind, DecisionKind::Fire);
-        assert_eq!(parsed.poly_yes_mid, Some(0.34));
+    fn time_bucket_thresholds() {
+        assert_eq!(time_bucket_for(300.0), "early");
+        assert_eq!(time_bucket_for(241.0), "early");
+        assert_eq!(time_bucket_for(240.0), "mid");
+        assert_eq!(time_bucket_for(120.0), "mid");
+        assert_eq!(time_bucket_for(61.0), "mid");
+        assert_eq!(time_bucket_for(60.0), "late");
+        assert_eq!(time_bucket_for(10.0), "late");
+        assert_eq!(time_bucket_for(0.0), "late");
     }
 
     #[test]
-    fn logger_writes_and_appends() {
-        let dir = std::env::temp_dir().join(format!("polybot_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("decisions.ndjson");
-        let _ = std::fs::remove_file(&path);
-        let mut logger = DecisionLogger::open(path.clone()).unwrap();
+    fn resolution_record_round_trips() {
+        let r = ResolutionRecord {
+            schema_version: SCHEMA_VERSION,
+            local_ts_ns: "123".into(),
+            session_id: "s".into(),
+            bot_version: BOT_VERSION.into(),
+            market_id: "m".into(),
+            market_slug: "ms".into(),
+            end_epoch: 100,
+            resolved_outcome: "yes".into(),
+            position_side: Some("yes".into()),
+            position_shares: Some(2.0),
+            position_cost_usd: Some(1.0),
+            position_avg_price: Some(0.5),
+            settled_proceeds_usd: Some(2.0),
+            settled_pnl_usd: Some(1.0),
+            winning_side: Some(true),
+        };
+        let line = serde_json::to_string(&r).unwrap();
+        let parsed: ResolutionRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed.settled_pnl_usd, Some(1.0));
+        assert_eq!(parsed.resolved_outcome, "yes");
+    }
 
-        let mut rec = DecisionRecord {
+    fn empty_record() -> DecisionRecord {
+        DecisionRecord {
             schema_version: SCHEMA_VERSION,
             local_ts_ns: "1".into(),
             session_id: "s".into(),
@@ -313,10 +313,25 @@ mod tests {
             poly_yes_bid: None,
             poly_yes_ask: None,
             poly_yes_mid: None,
+            poly_yes_bid_size: None,
+            poly_yes_ask_size: None,
+            poly_yes_spread: None,
             poly_no_bid: None,
             poly_no_ask: None,
             poly_no_mid: None,
+            poly_no_bid_size: None,
+            poly_no_ask_size: None,
+            poly_no_spread: None,
             poly_book_age_ms: None,
+            btc_log_return_5s: None,
+            btc_log_return_30s: None,
+            btc_log_return_60s: None,
+            btc_log_return_300s: None,
+            sigma_per_sec_5s: None,
+            sigma_per_sec_30s: None,
+            sigma_per_sec_60s: None,
+            sigma_per_sec_300s: None,
+            time_bucket: None,
             implied_strike_usd: None,
             strike_gap_usd: None,
             strike_gap_bps: None,
@@ -332,8 +347,44 @@ mod tests {
             decision_price: None,
             no_signal_reason: None,
             reject_reason: None,
-            incomplete_reason: Some(IncompleteReason::NoStrike),
-        };
+            incomplete_reason: None,
+        }
+    }
+
+    #[test]
+    fn round_trip_record_through_serde_json() {
+        let mut r = empty_record();
+        r.market_id = "0xabc".into();
+        r.binance_btc_mid_usd = Some(78_089.79);
+        r.poly_yes_mid = Some(0.34);
+        r.poly_yes_bid_size = Some(120.0);
+        r.poly_yes_ask_size = Some(80.0);
+        r.poly_yes_spread = Some(0.02);
+        r.btc_log_return_30s = Some(0.0003);
+        r.sigma_per_sec_60s = Some(4.5e-4);
+        r.time_bucket = Some("mid".into());
+        r.decision_kind = DecisionKind::Fire;
+        r.decision_side = Some("yes".into());
+        let line = serde_json::to_string(&r).unwrap();
+        let parsed: DecisionRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed.market_id, r.market_id);
+        assert_eq!(parsed.decision_kind, DecisionKind::Fire);
+        assert_eq!(parsed.poly_yes_mid, Some(0.34));
+        assert_eq!(parsed.poly_yes_bid_size, Some(120.0));
+        assert_eq!(parsed.btc_log_return_30s, Some(0.0003));
+        assert_eq!(parsed.time_bucket.as_deref(), Some("mid"));
+    }
+
+    #[test]
+    fn logger_writes_and_appends() {
+        let dir = std::env::temp_dir().join(format!("polybot_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("decisions.ndjson");
+        let _ = std::fs::remove_file(&path);
+        let mut logger = DecisionLogger::open(path.clone()).unwrap();
+
+        let mut rec = empty_record();
+        rec.incomplete_reason = Some(IncompleteReason::NoStrike);
         logger.write(&rec).unwrap();
         rec.local_ts_ns = "2".into();
         logger.write(&rec).unwrap();
@@ -360,5 +411,82 @@ pub fn reject_reason_to_str(r: &RejectReason) -> &'static str {
         RejectReason::Cooldown => "cooldown",
         RejectReason::NotionalCapReached => "notional_cap_reached",
         RejectReason::InternalError => "internal_error",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolution log
+// ---------------------------------------------------------------------------
+
+/// One row in `resolutions.ndjson`. Written when the resolution sweeper
+/// observes a market we've previously evaluated transitioning to resolved.
+/// Position fields are populated when we held a paper position; null
+/// otherwise (resolution still logged for label-only purposes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolutionRecord {
+    pub schema_version: u32,
+    pub local_ts_ns: String,
+    pub session_id: String,
+    pub bot_version: String,
+    pub market_id: String,
+    pub market_slug: String,
+    pub end_epoch: i64,
+    pub resolved_outcome: String, // "yes" / "no"
+
+    // Settlement, if we held a position at the time of resolution.
+    pub position_side: Option<String>,
+    pub position_shares: Option<f64>,
+    pub position_cost_usd: Option<f64>,
+    pub position_avg_price: Option<f64>,
+    pub settled_proceeds_usd: Option<f64>,
+    pub settled_pnl_usd: Option<f64>,
+    pub winning_side: Option<bool>,
+}
+
+/// Writer for `resolutions.ndjson`. Same flush-per-write pattern as
+/// `DecisionLogger`.
+pub struct ResolutionLogger {
+    writer: BufWriter<File>,
+    path: PathBuf,
+}
+
+impl ResolutionLogger {
+    pub fn open(path: PathBuf) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            path,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn write(&mut self, rec: &ResolutionRecord) -> std::io::Result<()> {
+        let line = serde_json::to_string(rec)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+}
+
+/// Derive a coarse time-bucket label from `ttr_secs`. Used by the
+/// strategy and the decision log to tag which "phase" of a 5-min market
+/// the decision happened in.
+pub fn time_bucket_for(ttr_secs: f64) -> &'static str {
+    if ttr_secs > 240.0 {
+        "early"
+    } else if ttr_secs > 60.0 {
+        "mid"
+    } else {
+        "late"
     }
 }

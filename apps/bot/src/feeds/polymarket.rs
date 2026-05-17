@@ -7,6 +7,7 @@
 //! No order placement in v0 — that's behind the live-mode gate (and needs
 //! wallet creds we don't have yet).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use market_registry::{GammaAdapter, Market};
@@ -236,13 +237,23 @@ pub async fn run_book_poller(
             fetch_one_tob(&client, &no_url),
         );
 
-        let (yes_bid, yes_ask) = match yes_res {
-            Some((b, a)) => (Some(b), Some(a)),
-            None => (None, None),
+        let (yes_bid, yes_ask, yes_bid_size, yes_ask_size) = match yes_res {
+            Some(t) => (
+                Some(t.bid_price),
+                Some(t.ask_price),
+                Some(t.bid_size),
+                Some(t.ask_size),
+            ),
+            None => (None, None, None, None),
         };
-        let (no_bid, no_ask) = match no_res {
-            Some((b, a)) => (Some(b), Some(a)),
-            None => (None, None),
+        let (no_bid, no_ask, no_bid_size, no_ask_size) = match no_res {
+            Some(t) => (
+                Some(t.bid_price),
+                Some(t.ask_price),
+                Some(t.bid_size),
+                Some(t.ask_size),
+            ),
+            None => (None, None, None, None),
         };
 
         if yes_bid.is_none() && no_bid.is_none() {
@@ -254,8 +265,12 @@ pub async fn run_book_poller(
         let snapshot = PolyBookSnapshot {
             yes_bid,
             yes_ask,
+            yes_bid_size,
+            yes_ask_size,
             no_bid,
             no_ask,
+            no_bid_size,
+            no_ask_size,
             captured_local_ts_ns: t_ns,
         };
         let ev = BotEvent::PolyBook {
@@ -269,10 +284,91 @@ pub async fn run_book_poller(
     }
 }
 
-/// Fetch one side's book and return its `(best_bid, best_ask)` if the
-/// response is usable. Logs at debug for routine failures so the
-/// foreground loop isn't spammed during venue hiccups.
-async fn fetch_one_tob(client: &Client, url: &str) -> Option<(f64, f64)> {
+// ---------------------------------------------------------------------------
+// Resolution sweeper
+// ---------------------------------------------------------------------------
+
+/// Periodically poll Gamma `?closed=true` for resolved markets and emit
+/// `BotEvent::MarketResolved` for any market we haven't already seen
+/// resolve.
+///
+/// Uses the recorder's existing `GammaAdapter::fetch_resolved_events()`
+/// which already filters to the configured series + sorts by endDate
+/// descending. Dedups in-process via a HashSet of seen market IDs.
+pub async fn run_resolution_sweeper(
+    cfg: GammaSettings,
+    tx: mpsc::Sender<BotEvent>,
+    poll_secs: u64,
+) {
+    let rec_cfg = config::MarketDiscoveryConfig {
+        gamma_url: cfg.url.clone(),
+        poll_interval_secs: cfg.poll_interval_secs,
+        series_slug: cfg.series_slug.clone(),
+    };
+    let adapter = match GammaAdapter::new(&rec_cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(component = "resolution_sweeper", error = %e, "adapter; sweeper disabled");
+            return;
+        }
+    };
+
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    loop {
+        match adapter.fetch_resolved_events().await {
+            Ok(resolved) => {
+                let mut emitted = 0usize;
+                for rm in resolved {
+                    let id_str = rm.market.id.as_str().to_string();
+                    if seen_ids.contains(&id_str) {
+                        continue;
+                    }
+                    if let Some(outcome) = rm.market.resolved_outcome {
+                        let ev = BotEvent::MarketResolved {
+                            market_id: rm.market.id.clone(),
+                            market_slug: rm.market.slug.clone(),
+                            end_epoch: rm.market.end_time_epoch,
+                            outcome,
+                        };
+                        if tx.send(ev).await.is_err() {
+                            return;
+                        }
+                        seen_ids.insert(id_str);
+                        emitted += 1;
+                    }
+                }
+                if emitted > 0 {
+                    info!(
+                        component = "resolution_sweeper",
+                        emitted = emitted,
+                        seen_total = seen_ids.len(),
+                        "emitted new resolutions"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(component = "resolution_sweeper", error = %e, "fetch failed; will retry");
+            }
+        }
+        sleep(Duration::from_secs(poll_secs.max(5))).await;
+    }
+}
+
+/// Top-of-book pair with sizes. `bid_size` / `ask_size` are USDC-denominated
+/// share counts at that price level (Polymarket sizes are in shares; price ×
+/// shares ≈ USDC notional).
+#[derive(Debug, Clone, Copy)]
+struct TopOfBook {
+    bid_price: f64,
+    bid_size: f64,
+    ask_price: f64,
+    ask_size: f64,
+}
+
+/// Fetch one side's book and return its top-of-book TOB if the response
+/// is usable. Routine failures log at debug to avoid foreground spam.
+async fn fetch_one_tob(client: &Client, url: &str) -> Option<TopOfBook> {
     match client.get(url).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -315,34 +411,77 @@ struct CloBookLevel {
     size: Option<String>,
 }
 
-/// Compute top-of-book `(best_bid, best_ask)` from a CLOB book response.
-/// Returns `None` if either side is empty or the book is crossed/zero-
-/// spread. Sorts defensively — `best_bid = max(bids.price)`, `best_ask
-/// = min(asks.price)` — so venue ordering doesn't matter.
-fn parse_book_tob(body: &str) -> Option<(f64, f64)> {
+/// Extract top-of-book (best bid+size, best ask+size) from a CLOB book
+/// response. Returns `None` if either side is empty or the book is
+/// crossed/zero-spread. Sorts defensively — `best_bid = max(bids.price)`,
+/// `best_ask = min(asks.price)`. Sizes are paired with the chosen prices.
+fn parse_book_tob(body: &str) -> Option<TopOfBook> {
     let parsed: CloBookResponse = serde_json::from_str(body).ok()?;
     let best_bid = parsed
         .bids
         .iter()
-        .filter_map(|l| l.price.parse::<f64>().ok())
-        .filter(|p| p.is_finite() && *p > 0.0 && *p < 1.0)
-        .fold(None::<f64>, |acc, p| match acc {
-            None => Some(p),
-            Some(cur) => Some(cur.max(p)),
+        .filter_map(|l| {
+            let p = l.price.parse::<f64>().ok()?;
+            if !(p.is_finite() && p > 0.0 && p < 1.0) {
+                return None;
+            }
+            let s = l
+                .size
+                .as_ref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .unwrap_or(0.0);
+            Some((p, s))
+        })
+        .fold(None::<(f64, f64)>, |acc, (p, s)| match acc {
+            None => Some((p, s)),
+            Some((cp, cs)) => {
+                if p > cp {
+                    Some((p, s))
+                } else if p == cp {
+                    Some((cp, cs + s))
+                } else {
+                    Some((cp, cs))
+                }
+            }
         })?;
     let best_ask = parsed
         .asks
         .iter()
-        .filter_map(|l| l.price.parse::<f64>().ok())
-        .filter(|p| p.is_finite() && *p > 0.0 && *p < 1.0)
-        .fold(None::<f64>, |acc, p| match acc {
-            None => Some(p),
-            Some(cur) => Some(cur.min(p)),
+        .filter_map(|l| {
+            let p = l.price.parse::<f64>().ok()?;
+            if !(p.is_finite() && p > 0.0 && p < 1.0) {
+                return None;
+            }
+            let s = l
+                .size
+                .as_ref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .unwrap_or(0.0);
+            Some((p, s))
+        })
+        .fold(None::<(f64, f64)>, |acc, (p, s)| match acc {
+            None => Some((p, s)),
+            Some((cp, cs)) => {
+                if p < cp {
+                    Some((p, s))
+                } else if p == cp {
+                    Some((cp, cs + s))
+                } else {
+                    Some((cp, cs))
+                }
+            }
         })?;
-    if best_ask <= best_bid {
+    if best_ask.0 <= best_bid.0 {
         return None;
     }
-    Some((best_bid, best_ask))
+    Some(TopOfBook {
+        bid_price: best_bid.0,
+        bid_size: best_bid.1,
+        ask_price: best_ask.0,
+        ask_size: best_ask.1,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -419,9 +558,23 @@ mod tests {
             "bids":[{"price":"0.48","size":"100"},{"price":"0.49","size":"50"}],
             "asks":[{"price":"0.52","size":"100"},{"price":"0.51","size":"50"}]
         }"#;
-        let (bid, ask) = parse_book_tob(body).expect("should parse");
-        assert!((bid - 0.49).abs() < 1e-9);
-        assert!((ask - 0.51).abs() < 1e-9);
+        let tob = parse_book_tob(body).expect("should parse");
+        assert!((tob.bid_price - 0.49).abs() < 1e-9);
+        assert!((tob.bid_size - 50.0).abs() < 1e-9);
+        assert!((tob.ask_price - 0.51).abs() < 1e-9);
+        assert!((tob.ask_size - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_book_aggregates_size_at_same_best_price() {
+        // Two levels at the same best price — sum their sizes.
+        let body = r#"{
+            "bids":[{"price":"0.49","size":"20"},{"price":"0.49","size":"30"}],
+            "asks":[{"price":"0.51","size":"15"},{"price":"0.51","size":"25"}]
+        }"#;
+        let tob = parse_book_tob(body).expect("should parse");
+        assert!((tob.bid_size - 50.0).abs() < 1e-9);
+        assert!((tob.ask_size - 40.0).abs() < 1e-9);
     }
 
     #[test]
@@ -438,9 +591,19 @@ mod tests {
 
     #[test]
     fn parse_book_ignores_garbage_prices() {
-        let body = r#"{"bids":[{"price":"abc"},{"price":"0.49"}],"asks":[{"price":"xx"},{"price":"0.51"}]}"#;
-        let (bid, ask) = parse_book_tob(body).expect("should parse");
-        assert!((bid - 0.49).abs() < 1e-9);
-        assert!((ask - 0.51).abs() < 1e-9);
+        let body = r#"{"bids":[{"price":"abc"},{"price":"0.49","size":"7"}],"asks":[{"price":"xx"},{"price":"0.51","size":"3"}]}"#;
+        let tob = parse_book_tob(body).expect("should parse");
+        assert!((tob.bid_price - 0.49).abs() < 1e-9);
+        assert!((tob.ask_price - 0.51).abs() < 1e-9);
+        assert!((tob.bid_size - 7.0).abs() < 1e-9);
+        assert!((tob.ask_size - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_book_handles_missing_size() {
+        let body = r#"{"bids":[{"price":"0.49"}],"asks":[{"price":"0.51"}]}"#;
+        let tob = parse_book_tob(body).expect("should parse");
+        assert!((tob.bid_price - 0.49).abs() < 1e-9);
+        assert!((tob.bid_size - 0.0).abs() < 1e-9);
     }
 }

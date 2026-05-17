@@ -11,15 +11,20 @@ use market_registry::Market;
 use serde::{Deserialize, Serialize};
 
 /// Top-of-book snapshot for one Polymarket market — both YES and NO
-/// sides. Each side is independent; we don't assume `yes + no = 1`
-/// because Polymarket's two tokens have separate order books and small
-/// arbitrage gaps are routine.
+/// sides. Each side carries best bid/ask price AND the size at that
+/// level (depth proxy). Sides are independent; we don't assume `yes + no
+/// = 1` because Polymarket's two tokens have separate order books and
+/// small arbitrage gaps are routine.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolyBookSnapshot {
     pub yes_bid: Option<f64>,
     pub yes_ask: Option<f64>,
+    pub yes_bid_size: Option<f64>,
+    pub yes_ask_size: Option<f64>,
     pub no_bid: Option<f64>,
     pub no_ask: Option<f64>,
+    pub no_bid_size: Option<f64>,
+    pub no_ask_size: Option<f64>,
     /// Local-clock ns at which the snapshot was assembled.
     pub captured_local_ts_ns: u128,
 }
@@ -34,6 +39,18 @@ impl PolyBookSnapshot {
     pub fn no_mid(&self) -> Option<f64> {
         match (self.no_bid, self.no_ask) {
             (Some(b), Some(a)) if a > b => Some(0.5 * (a + b)),
+            _ => None,
+        }
+    }
+    pub fn yes_spread(&self) -> Option<f64> {
+        match (self.yes_bid, self.yes_ask) {
+            (Some(b), Some(a)) if a > b => Some(a - b),
+            _ => None,
+        }
+    }
+    pub fn no_spread(&self) -> Option<f64> {
+        match (self.no_bid, self.no_ask) {
+            (Some(b), Some(a)) if a > b => Some(a - b),
             _ => None,
         }
     }
@@ -103,6 +120,21 @@ impl BtcHistory {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|&(_, mid)| mid)
+    }
+
+    /// Log-return over the past `window_secs`, anchored at the latest
+    /// sample. Returns `None` if the buffer doesn't reach back that far
+    /// or the latest is missing.
+    pub fn log_return_over(&self, window_secs: f64) -> Option<f64> {
+        let (latest_t, latest_mid) = self.latest()?;
+        if latest_mid <= 0.0 {
+            return None;
+        }
+        let past = self.at_time(latest_t - window_secs)?;
+        if past <= 0.0 {
+            return None;
+        }
+        Some((latest_mid / past).ln())
     }
 }
 
@@ -264,5 +296,36 @@ mod tests {
         assert!(s.yes_mid().is_none());
         s.yes_ask = Some(0.35); // crossed
         assert!(s.yes_mid().is_none());
+    }
+
+    #[test]
+    fn poly_snapshot_spread_helpers() {
+        let mut s = PolyBookSnapshot::default();
+        s.yes_bid = Some(0.34);
+        s.yes_ask = Some(0.36);
+        assert!((s.yes_spread().unwrap() - 0.02).abs() < 1e-9);
+        // crossed → None
+        s.yes_ask = Some(0.30);
+        assert!(s.yes_spread().is_none());
+    }
+
+    #[test]
+    fn btc_history_log_return_over_window() {
+        let mut h = BtcHistory::new(120.0);
+        // BTC goes 100 -> 102 over 60s
+        h.observe(0.0, 100.0);
+        h.observe(60.0, 102.0);
+        let r = h.log_return_over(60.0).expect("should return");
+        // ln(102/100) ≈ 0.0198
+        assert!((r - (102.0_f64 / 100.0).ln()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn btc_history_log_return_none_if_buffer_too_short() {
+        let mut h = BtcHistory::new(30.0);
+        h.observe(0.0, 100.0);
+        h.observe(60.0, 102.0); // prunes the t=0 sample (cutoff = 30)
+        // window of 60s ago — not in buffer.
+        assert!(h.log_return_over(60.0).is_none());
     }
 }
