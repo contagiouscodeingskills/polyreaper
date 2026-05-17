@@ -8,6 +8,36 @@
 use std::collections::VecDeque;
 
 use market_registry::Market;
+use serde::{Deserialize, Serialize};
+
+/// Top-of-book snapshot for one Polymarket market — both YES and NO
+/// sides. Each side is independent; we don't assume `yes + no = 1`
+/// because Polymarket's two tokens have separate order books and small
+/// arbitrage gaps are routine.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PolyBookSnapshot {
+    pub yes_bid: Option<f64>,
+    pub yes_ask: Option<f64>,
+    pub no_bid: Option<f64>,
+    pub no_ask: Option<f64>,
+    /// Local-clock ns at which the snapshot was assembled.
+    pub captured_local_ts_ns: u128,
+}
+
+impl PolyBookSnapshot {
+    pub fn yes_mid(&self) -> Option<f64> {
+        match (self.yes_bid, self.yes_ask) {
+            (Some(b), Some(a)) if a > b => Some(0.5 * (a + b)),
+            _ => None,
+        }
+    }
+    pub fn no_mid(&self) -> Option<f64> {
+        match (self.no_bid, self.no_ask) {
+            (Some(b), Some(a)) if a > b => Some(0.5 * (a + b)),
+            _ => None,
+        }
+    }
+}
 
 /// Rolling buffer of `(t_secs_since_unix_epoch, btc_mid_usd)` samples.
 /// Used to look up the BTC price at a past timestamp (e.g. when a new
@@ -86,8 +116,10 @@ pub struct ActiveMarket {
     /// case we refuse to trade this market (can't compute fair value
     /// without a strike).
     pub strike: Option<f64>,
-    /// Most recent Polymarket YES-side mid observed for this market.
-    pub last_poly_yes_mid: Option<f64>,
+    /// Most recent Polymarket top-of-book snapshot (YES + NO) for this
+    /// market. Drives the strategy and powers the decision-log
+    /// diagnostics (implied-strike, gap to Binance-snapped strike).
+    pub last_poly_snapshot: Option<PolyBookSnapshot>,
 }
 
 impl ActiveMarket {
@@ -103,7 +135,7 @@ impl ActiveMarket {
         Self {
             market,
             strike,
-            last_poly_yes_mid: None,
+            last_poly_snapshot: None,
         }
     }
 
@@ -212,5 +244,25 @@ mod tests {
         assert_eq!(m.ttr_secs(50.0), 50.0);
         assert_eq!(m.ttr_secs(100.0), 0.0);
         assert_eq!(m.ttr_secs(200.0), 0.0);
+    }
+
+    #[test]
+    fn poly_snapshot_mid_requires_both_sides() {
+        let mut s = PolyBookSnapshot::default();
+        assert!(s.yes_mid().is_none());
+        s.yes_bid = Some(0.34);
+        assert!(s.yes_mid().is_none()); // missing ask
+        s.yes_ask = Some(0.36);
+        assert!((s.yes_mid().unwrap() - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn poly_snapshot_rejects_crossed_or_zero_spread() {
+        let mut s = PolyBookSnapshot::default();
+        s.yes_bid = Some(0.40);
+        s.yes_ask = Some(0.40); // zero spread → not a useful mid
+        assert!(s.yes_mid().is_none());
+        s.yes_ask = Some(0.35); // crossed
+        assert!(s.yes_mid().is_none());
     }
 }

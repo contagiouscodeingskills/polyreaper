@@ -45,30 +45,51 @@ pub struct DecisionInputs<'a> {
     pub max_per_trade_usd: f64,
 }
 
-/// Pure function: given the inputs and config, optionally emit a Signal.
-pub fn decide(inputs: DecisionInputs<'_>, cfg: &StrategyConfig) -> Option<Signal> {
-    // Time gate.
+/// Outcome of one strategy tick.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StrategyOutcome {
+    /// Strategy wants to fire.
+    Fire(Signal),
+    /// Strategy explicitly declined to fire. Carries the reason so it can
+    /// be logged for diagnostics.
+    NoSignal(NoSignalReason),
+}
+
+/// Why the strategy chose not to emit a signal. Serialises as a short
+/// snake_case string for the decision log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoSignalReason {
+    /// Time-to-resolution below the configured floor (freeze window).
+    TtrBelowMin,
+    /// Polymarket mid was outside `[0,1]` — venue glitch or missing data.
+    PolyMidOutOfRange,
+    /// `|FV - poly_mid|` was below `min_edge` (not worth fees + spread).
+    EdgeBelowMin,
+    /// Sizing computed to non-positive — defensive guard.
+    SizeNonPositive,
+}
+
+/// Pure function: given the inputs and config, emit a `Fire(signal)` or
+/// `NoSignal(reason)`. Caller logs the reason for diagnostics.
+pub fn decide(inputs: DecisionInputs<'_>, cfg: &StrategyConfig) -> StrategyOutcome {
     if !inputs.ttr_secs.is_finite() || inputs.ttr_secs < cfg.min_ttr_secs {
-        return None;
+        return StrategyOutcome::NoSignal(NoSignalReason::TtrBelowMin);
     }
-    // Sanity-bound the Polymarket mid.
     if !(0.0..=1.0).contains(&inputs.poly_yes_mid) {
-        return None;
+        return StrategyOutcome::NoSignal(NoSignalReason::PolyMidOutOfRange);
     }
-    // YES-side edge. Symmetric — we trade YES if FV>mid, NO if FV<mid.
     let yes_edge = inputs.fair_value.p_yes - inputs.poly_yes_mid;
     let abs_edge = yes_edge.abs();
     if abs_edge < cfg.min_edge {
-        return None;
+        return StrategyOutcome::NoSignal(NoSignalReason::EdgeBelowMin);
     }
-    // EV-scaled sizing.
-    let scale = ((abs_edge - cfg.min_edge) / (cfg.edge_scale - cfg.min_edge))
-        .clamp(0.0, 1.0);
+    let scale =
+        ((abs_edge - cfg.min_edge) / (cfg.edge_scale - cfg.min_edge)).clamp(0.0, 1.0);
     let size_usd = inputs.max_per_trade_usd * scale;
     if size_usd <= 0.0 {
-        return None;
+        return StrategyOutcome::NoSignal(NoSignalReason::SizeNonPositive);
     }
-    // Side, target price.
     let (side, fv_for_side, mid_for_side, edge) = if yes_edge > 0.0 {
         (
             Outcome::Yes,
@@ -84,7 +105,7 @@ pub fn decide(inputs: DecisionInputs<'_>, cfg: &StrategyConfig) -> Option<Signal
             -yes_edge,
         )
     };
-    Some(Signal {
+    StrategyOutcome::Fire(Signal {
         market_id: inputs.market_id.clone(),
         side,
         size_usd,
@@ -106,10 +127,24 @@ mod tests {
         (MarketId::new("M"), StrategyConfig::default())
     }
 
+    fn expect_fire(outcome: StrategyOutcome) -> Signal {
+        match outcome {
+            StrategyOutcome::Fire(s) => s,
+            StrategyOutcome::NoSignal(r) => panic!("expected fire, got NoSignal({r:?})"),
+        }
+    }
+
+    fn expect_no_signal(outcome: StrategyOutcome) -> NoSignalReason {
+        match outcome {
+            StrategyOutcome::NoSignal(r) => r,
+            StrategyOutcome::Fire(s) => panic!("expected NoSignal, got Fire({s:?})"),
+        }
+    }
+
     #[test]
     fn no_signal_below_min_edge() {
         let (m, cfg) = ctx();
-        let sig = decide(
+        let out = decide(
             DecisionInputs {
                 market_id: &m,
                 fair_value: FairValue::from_p_yes(0.51),
@@ -119,13 +154,13 @@ mod tests {
             },
             &cfg,
         );
-        assert!(sig.is_none(), "0.01 edge < min_edge=0.02 should not fire");
+        assert_eq!(expect_no_signal(out), NoSignalReason::EdgeBelowMin);
     }
 
     #[test]
     fn no_signal_in_freeze_window() {
         let (m, cfg) = ctx();
-        let sig = decide(
+        let out = decide(
             DecisionInputs {
                 market_id: &m,
                 fair_value: FairValue::from_p_yes(0.70),
@@ -135,13 +170,29 @@ mod tests {
             },
             &cfg,
         );
-        assert!(sig.is_none(), "ttr below min_ttr should not fire");
+        assert_eq!(expect_no_signal(out), NoSignalReason::TtrBelowMin);
+    }
+
+    #[test]
+    fn no_signal_when_poly_mid_out_of_range() {
+        let (m, cfg) = ctx();
+        let out = decide(
+            DecisionInputs {
+                market_id: &m,
+                fair_value: FairValue::from_p_yes(0.5),
+                poly_yes_mid: 1.5,
+                ttr_secs: 120.0,
+                max_per_trade_usd: 1.0,
+            },
+            &cfg,
+        );
+        assert_eq!(expect_no_signal(out), NoSignalReason::PolyMidOutOfRange);
     }
 
     #[test]
     fn fires_yes_when_fv_above_mid() {
         let (m, cfg) = ctx();
-        let sig = decide(
+        let sig = expect_fire(decide(
             DecisionInputs {
                 market_id: &m,
                 fair_value: FairValue::from_p_yes(0.60),
@@ -150,8 +201,7 @@ mod tests {
                 max_per_trade_usd: 1.0,
             },
             &cfg,
-        )
-        .expect("should fire");
+        ));
         assert_eq!(sig.side, Outcome::Yes);
         assert!(sig.size_usd > 0.0 && sig.size_usd <= 1.0);
         assert!((sig.edge - 0.10).abs() < 1e-9);
@@ -160,7 +210,7 @@ mod tests {
     #[test]
     fn fires_no_when_fv_below_mid() {
         let (m, cfg) = ctx();
-        let sig = decide(
+        let sig = expect_fire(decide(
             DecisionInputs {
                 market_id: &m,
                 fair_value: FairValue::from_p_yes(0.40),
@@ -169,10 +219,8 @@ mod tests {
                 max_per_trade_usd: 1.0,
             },
             &cfg,
-        )
-        .expect("should fire");
+        ));
         assert_eq!(sig.side, Outcome::No);
-        // NO mid = 1 - 0.5 = 0.5; NO fv = 1 - 0.4 = 0.6; edge = 0.1.
         assert!((sig.edge - 0.10).abs() < 1e-9);
         assert!((sig.fv_for_side - 0.60).abs() < 1e-9);
         assert!((sig.mid_for_side - 0.50).abs() < 1e-9);
@@ -181,7 +229,7 @@ mod tests {
     #[test]
     fn size_scales_with_edge() {
         let (m, cfg) = ctx();
-        let s_small = decide(
+        let s_small = expect_fire(decide(
             DecisionInputs {
                 market_id: &m,
                 fair_value: FairValue::from_p_yes(0.53),
@@ -190,9 +238,8 @@ mod tests {
                 max_per_trade_usd: 1.0,
             },
             &cfg,
-        )
-        .unwrap();
-        let s_big = decide(
+        ));
+        let s_big = expect_fire(decide(
             DecisionInputs {
                 market_id: &m,
                 fair_value: FairValue::from_p_yes(0.60),
@@ -201,8 +248,7 @@ mod tests {
                 max_per_trade_usd: 1.0,
             },
             &cfg,
-        )
-        .unwrap();
+        ));
         assert!(s_big.size_usd > s_small.size_usd);
         assert!(s_big.size_usd <= 1.0);
     }
@@ -210,7 +256,7 @@ mod tests {
     #[test]
     fn size_caps_at_full_at_or_above_edge_scale() {
         let (m, cfg) = ctx();
-        let sig = decide(
+        let sig = expect_fire(decide(
             DecisionInputs {
                 market_id: &m,
                 fair_value: FairValue::from_p_yes(0.20),
@@ -219,9 +265,7 @@ mod tests {
                 max_per_trade_usd: 1.0,
             },
             &cfg,
-        )
-        .unwrap();
-        // |edge| = 0.30 > edge_scale=0.08 → max size
+        ));
         assert!((sig.size_usd - 1.0).abs() < 1e-9);
     }
 }

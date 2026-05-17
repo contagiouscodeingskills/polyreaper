@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::bot::BotEvent;
 use crate::config::{GammaSettings, PolymarketFeedSettings};
+use crate::market_state::PolyBookSnapshot;
 
 // ---------------------------------------------------------------------------
 // Market discovery loop
@@ -185,12 +186,15 @@ fn chrono_now_epoch_secs() -> i64 {
 // CLOB book poller
 // ---------------------------------------------------------------------------
 
-/// Poll the CLOB book for the currently-active market's YES token. Emits
-/// `PolyBook` snapshots on every successful poll.
+/// Poll the CLOB book for the currently-active market's YES *and* NO
+/// tokens, in parallel. Emits one `PolyBook` event per poll carrying a
+/// full `PolyBookSnapshot` (both sides' bid/ask), so the bot can use
+/// the YES mid for trading decisions and log the NO side + ask/bid
+/// detail for diagnostics.
 ///
-/// The poller reads `active_market_rx` to know which token to fetch.
-/// Restarts polling cleanly when the active market changes — no stale
-/// snapshots from the previous market.
+/// The poller reads `active_market_rx` to know which market to fetch.
+/// Late responses from a previous market are dropped by the bot loop
+/// (which checks `snapshot.market_id` against its `active`).
 pub async fn run_book_poller(
     cfg: PolymarketFeedSettings,
     mut active_market_rx: watch::Receiver<Option<Market>>,
@@ -211,7 +215,6 @@ pub async fn run_book_poller(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        // Wait for either an active market or a tick.
         tokio::select! {
             _ = active_market_rx.changed() => {}
             _ = interval.tick() => {}
@@ -221,43 +224,73 @@ pub async fn run_book_poller(
             Some(m) => m,
             None => continue,
         };
-        let token_id = market.yes_token.as_str().to_string();
-        let url = format!("{}/book?token_id={}", cfg.clob_url.trim_end_matches('/'), token_id);
 
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    warn!(component = "polymarket_book", status = %status, "non-200 from clob");
-                    continue;
-                }
-                let body = match resp.text().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(component = "polymarket_book", error = %e, "body read");
-                        continue;
-                    }
-                };
-                match parse_book_mid(&body) {
-                    Some(yes_mid) => {
-                        let t_ns = common::LocalTimestamp::now().as_nanos();
-                        let ev = BotEvent::PolyBook {
-                            t_ns,
-                            market_id: market.id.clone(),
-                            yes_mid,
-                        };
-                        if tx.send(ev).await.is_err() {
-                            return;
-                        }
-                    }
-                    None => {
-                        debug!(component = "polymarket_book", "no usable mid in book response");
-                    }
+        let base = cfg.clob_url.trim_end_matches('/');
+        let yes_url = format!("{}/book?token_id={}", base, market.yes_token);
+        let no_url = format!("{}/book?token_id={}", base, market.no_token);
+
+        // Fetch both sides concurrently — saves ~one round-trip per poll
+        // and keeps the YES/NO snapshot from straddling a price move.
+        let (yes_res, no_res) = tokio::join!(
+            fetch_one_tob(&client, &yes_url),
+            fetch_one_tob(&client, &no_url),
+        );
+
+        let (yes_bid, yes_ask) = match yes_res {
+            Some((b, a)) => (Some(b), Some(a)),
+            None => (None, None),
+        };
+        let (no_bid, no_ask) = match no_res {
+            Some((b, a)) => (Some(b), Some(a)),
+            None => (None, None),
+        };
+
+        if yes_bid.is_none() && no_bid.is_none() {
+            debug!(component = "polymarket_book", "no usable book on either side");
+            continue;
+        }
+
+        let t_ns = common::LocalTimestamp::now().as_nanos();
+        let snapshot = PolyBookSnapshot {
+            yes_bid,
+            yes_ask,
+            no_bid,
+            no_ask,
+            captured_local_ts_ns: t_ns,
+        };
+        let ev = BotEvent::PolyBook {
+            t_ns,
+            market_id: market.id.clone(),
+            snapshot,
+        };
+        if tx.send(ev).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Fetch one side's book and return its `(best_bid, best_ask)` if the
+/// response is usable. Logs at debug for routine failures so the
+/// foreground loop isn't spammed during venue hiccups.
+async fn fetch_one_tob(client: &Client, url: &str) -> Option<(f64, f64)> {
+    match client.get(url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                debug!(component = "polymarket_book", url = %url, status = %status, "non-200");
+                return None;
+            }
+            match resp.text().await {
+                Ok(body) => parse_book_tob(&body),
+                Err(e) => {
+                    debug!(component = "polymarket_book", error = %e, "body read");
+                    None
                 }
             }
-            Err(e) => {
-                warn!(component = "polymarket_book", error = %e, "http error");
-            }
+        }
+        Err(e) => {
+            debug!(component = "polymarket_book", error = %e, "http error");
+            None
         }
     }
 }
@@ -282,12 +315,11 @@ struct CloBookLevel {
     size: Option<String>,
 }
 
-/// Compute YES-side mid = (best_bid + best_ask) / 2 from a CLOB book
-/// response. Returns `None` if either side is empty or unparseable.
-///
-/// Sorts defensively rather than assuming the venue's ordering: best_bid
-/// = max(bids.price), best_ask = min(asks.price).
-fn parse_book_mid(body: &str) -> Option<f64> {
+/// Compute top-of-book `(best_bid, best_ask)` from a CLOB book response.
+/// Returns `None` if either side is empty or the book is crossed/zero-
+/// spread. Sorts defensively — `best_bid = max(bids.price)`, `best_ask
+/// = min(asks.price)` — so venue ordering doesn't matter.
+fn parse_book_tob(body: &str) -> Option<(f64, f64)> {
     let parsed: CloBookResponse = serde_json::from_str(body).ok()?;
     let best_bid = parsed
         .bids
@@ -308,10 +340,9 @@ fn parse_book_mid(body: &str) -> Option<f64> {
             Some(cur) => Some(cur.min(p)),
         })?;
     if best_ask <= best_bid {
-        // Crossed or zero spread — distrust and skip this tick.
         return None;
     }
-    Some((best_bid + best_ask) / 2.0)
+    Some((best_bid, best_ask))
 }
 
 // ---------------------------------------------------------------------------
@@ -384,33 +415,32 @@ mod tests {
 
     #[test]
     fn parse_book_picks_best_levels_defensively() {
-        // Both sides emitted out-of-order — best_bid should be highest,
-        // best_ask should be lowest.
         let body = r#"{
             "bids":[{"price":"0.48","size":"100"},{"price":"0.49","size":"50"}],
             "asks":[{"price":"0.52","size":"100"},{"price":"0.51","size":"50"}]
         }"#;
-        let mid = parse_book_mid(body).expect("should parse");
-        assert!((mid - 0.50).abs() < 1e-9);
+        let (bid, ask) = parse_book_tob(body).expect("should parse");
+        assert!((bid - 0.49).abs() < 1e-9);
+        assert!((ask - 0.51).abs() < 1e-9);
     }
 
     #[test]
     fn parse_book_returns_none_on_empty_side() {
         let body = r#"{"bids":[{"price":"0.5","size":"1"}],"asks":[]}"#;
-        assert!(parse_book_mid(body).is_none());
+        assert!(parse_book_tob(body).is_none());
     }
 
     #[test]
     fn parse_book_rejects_crossed_or_inverted_book() {
-        // best_ask < best_bid — venue glitch; refuse.
         let body = r#"{"bids":[{"price":"0.60","size":"1"}],"asks":[{"price":"0.40","size":"1"}]}"#;
-        assert!(parse_book_mid(body).is_none());
+        assert!(parse_book_tob(body).is_none());
     }
 
     #[test]
     fn parse_book_ignores_garbage_prices() {
         let body = r#"{"bids":[{"price":"abc"},{"price":"0.49"}],"asks":[{"price":"xx"},{"price":"0.51"}]}"#;
-        let mid = parse_book_mid(body).expect("should parse");
-        assert!((mid - 0.50).abs() < 1e-9);
+        let (bid, ask) = parse_book_tob(body).expect("should parse");
+        assert!((bid - 0.49).abs() < 1e-9);
+        assert!((ask - 0.51).abs() < 1e-9);
     }
 }

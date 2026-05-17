@@ -25,6 +25,7 @@
 
 pub mod bot;
 pub mod config;
+pub mod decision_log;
 pub mod execution;
 pub mod feeds;
 pub mod fv;

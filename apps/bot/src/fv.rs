@@ -63,6 +63,68 @@ impl FairValue {
     }
 }
 
+/// Inverse of `norm_cdf` via 40-iteration bisection on [-10, 10].
+/// Sufficient precision for diagnostic / logging use (≈ 1e-11 abs error
+/// on the input axis). Not optimised for hot paths.
+pub fn norm_cdf_inverse(p: f64) -> f64 {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) {
+        return f64::NAN;
+    }
+    if p <= 1e-15 {
+        return -10.0;
+    }
+    if p >= 1.0 - 1e-15 {
+        return 10.0;
+    }
+    let (mut lo, mut hi) = (-10.0_f64, 10.0_f64);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if norm_cdf(mid) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// Inverse of `compute_fv` on K: find the strike that makes the model
+/// predict `p_yes` for P(BTC_T > K) given the other inputs.
+///
+/// Used by the bot's diagnostic logging to back out what strike
+/// Polymarket appears to be pricing against. Comparing this to the
+/// Binance-snapped strike quantifies any cross-venue oracle divergence.
+///
+/// Returns `None` if inputs are degenerate or `p_yes` is too close to
+/// 0/1 for a reliable inverse.
+pub fn implied_strike(
+    btc_now: f64,
+    secs_to_resolution: f64,
+    sigma_per_sec: f64,
+    p_yes: f64,
+) -> Option<f64> {
+    if !(btc_now.is_finite()
+        && secs_to_resolution.is_finite()
+        && sigma_per_sec.is_finite()
+        && p_yes.is_finite())
+    {
+        return None;
+    }
+    if btc_now <= 0.0 || secs_to_resolution <= 0.0 || sigma_per_sec <= 0.0 {
+        return None;
+    }
+    if !(0.001..=0.999).contains(&p_yes) {
+        return None;
+    }
+    let sigma_t = sigma_per_sec * secs_to_resolution.sqrt();
+    let d = norm_cdf_inverse(p_yes);
+    // From compute_fv: d = (ln(S/K) - σ²T/2) / (σ√T), so
+    //   ln(S/K) = σ√T·d + σ²T/2
+    //   K = S · exp(-(σ√T·d + σ²T/2))
+    let log_ratio = sigma_t * d + 0.5 * sigma_t * sigma_t;
+    Some(btc_now * (-log_ratio).exp())
+}
+
 /// Compute P(BTC_T > K) under zero-drift GBM.
 ///
 /// - `btc_now`: current BTC mid, USD.
@@ -264,5 +326,52 @@ mod tests {
         }
         // Window is 10s; we wrote at t = 0..19, so only t in (9, 19] survive.
         assert!(est.len() <= 11);
+    }
+
+    #[test]
+    fn norm_cdf_inverse_round_trips() {
+        for p in [0.01, 0.10, 0.34, 0.50, 0.66, 0.90, 0.99] {
+            let x = norm_cdf_inverse(p);
+            let back = norm_cdf(x);
+            assert!(
+                (back - p).abs() < 1e-6,
+                "round-trip p={p}: x={x}, back={back}"
+            );
+        }
+    }
+
+    #[test]
+    fn norm_cdf_inverse_known_points() {
+        assert!((norm_cdf_inverse(0.5) - 0.0).abs() < 1e-6);
+        assert!((norm_cdf_inverse(0.84134) - 1.0).abs() < 1e-3);
+        assert!((norm_cdf_inverse(0.15866) + 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn implied_strike_round_trips() {
+        // For a chosen K, compute fv → p, then invert → K_back ≈ K.
+        let s = 78_000.0;
+        let t = 300.0;
+        let sigma = 1e-4;
+        for k_offset in [-100.0, -25.0, 0.0, 25.0, 100.0] {
+            let k = s + k_offset;
+            let fv = compute_fv(s, k, t, sigma);
+            let k_back = implied_strike(s, t, sigma, fv.p_yes).expect("invertible");
+            assert!(
+                (k_back - k).abs() / k < 1e-3,
+                "k={k}, k_back={k_back}, fv={}",
+                fv.p_yes
+            );
+        }
+    }
+
+    #[test]
+    fn implied_strike_returns_none_for_degenerate_inputs() {
+        assert!(implied_strike(0.0, 300.0, 1e-4, 0.5).is_none());
+        assert!(implied_strike(78_000.0, 0.0, 1e-4, 0.5).is_none());
+        assert!(implied_strike(78_000.0, 300.0, 0.0, 0.5).is_none());
+        assert!(implied_strike(78_000.0, 300.0, 1e-4, 0.0).is_none());
+        assert!(implied_strike(78_000.0, 300.0, 1e-4, 1.0).is_none());
+        assert!(implied_strike(78_000.0, 300.0, 1e-4, f64::NAN).is_none());
     }
 }
