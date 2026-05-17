@@ -23,11 +23,12 @@ use crate::decision_log::{
 };
 use crate::execution::PaperExecutor;
 use crate::feeds;
-use crate::fv::{compute_fv, implied_strike, FairValue, VolEstimator};
+use crate::fv::{compute_fv, implied_strike, VolEstimator};
 use crate::market_state::{ActiveMarket, BtcHistory, PolyBookSnapshot};
 use crate::position::PositionStore;
 use crate::risk::{RiskDecision, RiskEngine};
-use crate::strategy::{decide, DecisionInputs, StrategyOutcome};
+use crate::signals::scoring::{self, Features, Regime};
+use crate::strategy::{decide, taker_required_edge, DecisionInputs, StrategyOutcome};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -186,6 +187,14 @@ pub async fn run_paper(cfg: BotConfig) {
     status_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     status_ticker.tick().await;
 
+    // FV engine ticker — drives strategy evaluation independently of
+    // feed events, so the bot reacts to BTC moves between poly book
+    // polls. Cadence in StrategyConfig.fv_tick_ms (default 100ms).
+    let fv_tick_ms = cfg.strategy.fv_tick_ms.max(10);
+    let mut fv_ticker = tokio::time::interval(Duration::from_millis(fv_tick_ms));
+    fv_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    fv_ticker.tick().await; // skip immediate
+
     loop {
         tokio::select! {
             ev = events_rx.recv() => {
@@ -196,6 +205,9 @@ pub async fn run_paper(cfg: BotConfig) {
                         break;
                     }
                 }
+            }
+            _ = fv_ticker.tick() => {
+                state.evaluate_and_log(now_epoch_secs_f64());
             }
             _ = status_ticker.tick() => {
                 state.emit_status();
@@ -407,8 +419,69 @@ impl BotState {
             return;
         }
         am.last_poly_snapshot = Some(snapshot);
-        let now_s = now_epoch_secs_f64();
-        self.evaluate_and_log(now_s);
+        // Strategy evaluation is driven by the FV timer, not the book
+        // event. Just stash the latest book here.
+    }
+
+    /// Build the [`Features`] snapshot for the scoring model from current
+    /// state. Each field is `Some(_)` only when the underlying input is
+    /// available; missing inputs degrade the model gracefully.
+    fn extract_features(&self, am: &ActiveMarket, now_s: f64, sigma_used: f64) -> Features {
+        let mut f = Features::default();
+
+        let ttr = am.ttr_secs(now_s);
+        let btc_now = self.btc_history.latest().map(|(_, m)| m);
+
+        // Anchor feature: Z-score of BTC vs strike given σ × √TTR.
+        if let (Some(btc), Some(k)) = (btc_now, am.strike) {
+            if btc > 0.0 && k > 0.0 && sigma_used > 0.0 && ttr > 0.0 {
+                let sigma_t = sigma_used * ttr.sqrt();
+                if sigma_t > 0.0 {
+                    // ln(S/K) / σ√T  — dominant GBM Z-score term.
+                    f.btc_strike_distance_z = Some((btc / k).ln() / sigma_t);
+                }
+            }
+        }
+
+        // Multi-window BTC drift Z-scores.
+        let drift = |window: f64, vol: &VolEstimator, hist: &BtcHistory| -> Option<f64> {
+            let r = hist.log_return_over(window)?;
+            let s = vol.sigma_per_sec().filter(|s| s.is_finite() && *s > 1e-10)?;
+            let sigma_t = s * window.sqrt();
+            if sigma_t > 0.0 {
+                Some(r / sigma_t)
+            } else {
+                None
+            }
+        };
+        f.btc_drift_5s_z = drift(5.0, &self.vol.w5, &self.btc_history);
+        f.btc_drift_30s_z = drift(30.0, &self.vol.w30, &self.btc_history);
+        f.btc_drift_60s_z = drift(60.0, &self.vol.w60, &self.btc_history);
+
+        // Polymarket book features.
+        if let Some(snap) = am.last_poly_snapshot.as_ref() {
+            if let (Some(bs), Some(asz)) = (snap.yes_bid_size, snap.yes_ask_size) {
+                let total = bs + asz;
+                if total > 0.0 {
+                    f.yes_book_imbalance = Some((bs - asz) / total);
+                }
+            }
+            if let (Some(bs), Some(asz)) = (snap.no_bid_size, snap.no_ask_size) {
+                let total = bs + asz;
+                if total > 0.0 {
+                    f.no_book_imbalance = Some((bs - asz) / total);
+                }
+            }
+            if let Some(spread) = snap.yes_spread() {
+                let base = self.cfg.strategy.spread_baseline.max(1e-9);
+                f.yes_spread_normalized = Some((spread - base) / base);
+            }
+        }
+
+        // lag_yes deliberately left None in v1 — needs a separate
+        // "expected poly response" estimator. Future signal addition.
+
+        f
     }
 
     fn on_market_changed(&mut self, market: Market) {
@@ -501,7 +574,7 @@ impl BotState {
         rec.btc_history_len = self.btc_history.len();
         rec.vol_samples = self.vol.primary.len();
 
-        // Strategy state: σ source + FV + implied strike + edge.
+        // σ source.
         let (sigma_used, sigma_source) = match self
             .vol
             .primary
@@ -514,30 +587,23 @@ impl BotState {
 
         let strike = am.strike;
         let yes_mid = rec.poly_yes_mid;
+        let ttr = am.ttr_secs(now_s);
 
-        // Compute FV + implied strike only when we have enough inputs.
-        let fv: Option<FairValue> = match (latest_btc, strike) {
-            (Some(btc), Some(k)) => {
-                let ttr = am.ttr_secs(now_s);
-                if ttr > 0.0 {
-                    Some(compute_fv(btc, k, ttr.max(1.0), sigma_used))
-                } else {
-                    None
+        // Diagnostic: GBM fv + implied-strike still logged (independent of
+        // the scoring model). Useful for comparing the old vs new path.
+        if let (Some(btc), Some(k)) = (latest_btc, strike) {
+            if ttr > 0.0 {
+                let fv_gbm = compute_fv(btc, k, ttr.max(1.0), sigma_used);
+                rec.fv_yes = Some(fv_gbm.p_yes);
+                rec.fv_no = Some(fv_gbm.p_no);
+                rec.sigma_per_sec_used = Some(sigma_used);
+                rec.sigma_source = Some(sigma_source.to_string());
+                if let Some(mid) = yes_mid {
+                    rec.edge_yes = Some(fv_gbm.p_yes - mid);
                 }
-            }
-            _ => None,
-        };
-        if let Some(fv) = fv {
-            rec.fv_yes = Some(fv.p_yes);
-            rec.fv_no = Some(fv.p_no);
-            rec.sigma_per_sec_used = Some(sigma_used);
-            rec.sigma_source = Some(sigma_source.to_string());
-            if let Some(mid) = yes_mid {
-                rec.edge_yes = Some(fv.p_yes - mid);
             }
         }
         if let (Some(btc), Some(mid)) = (latest_btc, yes_mid) {
-            let ttr = am.ttr_secs(now_s);
             if ttr > 0.0 {
                 rec.implied_strike_usd =
                     implied_strike(btc, ttr.max(1.0), sigma_used, mid);
@@ -550,23 +616,54 @@ impl BotState {
             }
         }
 
+        // Build features + run the scoring model.
+        let features = self.extract_features(&am, now_s, sigma_used);
+        let regime = Regime::from_ttr_secs(ttr);
+        let scoring_outcome = scoring::score(&features, regime, &self.cfg.scoring);
+
+        if let Some(s) = scoring_outcome {
+            rec.scoring_p_yes = Some(s.p_yes);
+            rec.scoring_p_no = Some(s.p_no);
+            rec.scoring_raw = Some(s.raw);
+            rec.scoring_regime = Some(regime.as_str().to_string());
+        }
+        // Per-feature contribution diagnostics.
+        rec.feat_btc_strike_distance_z = features.btc_strike_distance_z;
+        rec.feat_btc_drift_5s_z = features.btc_drift_5s_z;
+        rec.feat_btc_drift_30s_z = features.btc_drift_30s_z;
+        rec.feat_btc_drift_60s_z = features.btc_drift_60s_z;
+        rec.feat_yes_book_imbalance = features.yes_book_imbalance;
+        rec.feat_no_book_imbalance = features.no_book_imbalance;
+        rec.feat_yes_spread_normalized = features.yes_spread_normalized;
+
         // Decide on the outcome.
-        let outcome = match (strike, yes_mid) {
+        let outcome = match (strike, scoring_outcome) {
             (None, _) => Outcome3::Incomplete(IncompleteReason::NoStrike),
-            (_, None) => Outcome3::Incomplete(IncompleteReason::NoPolyYesMid),
-            (Some(_), Some(mid)) => {
-                let ttr = am.ttr_secs(now_s);
-                if latest_btc.is_none() {
-                    Outcome3::Incomplete(IncompleteReason::NoBtcMid)
-                } else if ttr <= 0.0 {
+            (Some(_), None) => Outcome3::Incomplete(IncompleteReason::NoBtcMid),
+            (Some(_), Some(s_out)) => {
+                if ttr <= 0.0 {
                     Outcome3::Incomplete(IncompleteReason::TtrNonPositive)
+                } else if am.last_poly_snapshot.is_none() {
+                    Outcome3::Incomplete(IncompleteReason::NoPolyYesMid)
                 } else {
-                    let fv = fv.expect("fv present when strike + btc present");
+                    let snap = am.last_poly_snapshot.as_ref().unwrap();
+                    // Diagnostic: log required edges at each side's ask.
+                    if let Some(a) = snap.yes_ask {
+                        rec.taker_required_edge_yes =
+                            Some(taker_required_edge(a, &self.cfg.strategy));
+                    }
+                    if let Some(a) = snap.no_ask {
+                        rec.taker_required_edge_no =
+                            Some(taker_required_edge(a, &self.cfg.strategy));
+                    }
                     let strat = decide(
                         DecisionInputs {
                             market_id: &am.market.id,
-                            fair_value: fv,
-                            poly_yes_mid: mid,
+                            scoring_outcome: s_out,
+                            poly_yes_bid: snap.yes_bid,
+                            poly_yes_ask: snap.yes_ask,
+                            poly_no_bid: snap.no_bid,
+                            poly_no_ask: snap.no_ask,
                             ttr_secs: ttr,
                             max_per_trade_usd: self.cfg.risk.max_per_trade_usd,
                         },
@@ -574,18 +671,15 @@ impl BotState {
                     );
                     match strat {
                         StrategyOutcome::Fire(signal) => {
-                            let mark = self
-                                .positions
-                                .get(&am.market.id)
-                                .map(|pos| match pos.side {
-                                    Outcome::Yes => mid,
-                                    Outcome::No => 1.0 - mid,
-                                });
+                            let mark_mid = match signal.side {
+                                Outcome::Yes => snap.yes_mid(),
+                                Outcome::No => snap.no_mid(),
+                            };
                             match self.risk.evaluate(
                                 signal.clone(),
                                 &self.positions,
                                 &self.cfg.risk,
-                                mark,
+                                mark_mid,
                                 now_s,
                             ) {
                                 RiskDecision::Approve(approved) => {
@@ -766,6 +860,19 @@ fn base_record(am: &ActiveMarket, session_id: &str, now_s: f64) -> DecisionRecor
         sigma_per_sec_60s: None,
         sigma_per_sec_300s: None,
         time_bucket: None,
+        scoring_p_yes: None,
+        scoring_p_no: None,
+        scoring_raw: None,
+        scoring_regime: None,
+        feat_btc_strike_distance_z: None,
+        feat_btc_drift_5s_z: None,
+        feat_btc_drift_30s_z: None,
+        feat_btc_drift_60s_z: None,
+        feat_yes_book_imbalance: None,
+        feat_no_book_imbalance: None,
+        feat_yes_spread_normalized: None,
+        taker_required_edge_yes: None,
+        taker_required_edge_no: None,
         implied_strike_usd: None,
         strike_gap_usd: None,
         strike_gap_bps: None,
@@ -844,16 +951,55 @@ pub async fn run_synthetic_demo(cfg: BotConfig) {
             last_poly_update_t = t;
         }
 
+        // Use the scoring model directly: with default scoring weights
+        // (only Z carries weight 1.0), this exactly recovers compute_fv's
+        // Φ(d). The demo's purpose is to exercise the strategy/risk
+        // pipeline end-to-end, not to produce calibrated trades.
+        let regime = Regime::from_ttr_secs(ttr);
+        let s_out = match scoring::score(
+            &Features {
+                btc_strike_distance_z: {
+                    // d ≈ ln(S/K)/σ√T (drop the σ²T/2 term — negligible).
+                    let sigma_t = sigma * ttr.max(1.0).sqrt();
+                    if sigma_t > 0.0 {
+                        Some((btc / strike).ln() / sigma_t)
+                    } else {
+                        None
+                    }
+                },
+                ..Default::default()
+            },
+            regime,
+            &cfg.scoring,
+        ) {
+            Some(s) => s,
+            None => {
+                t += dt;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                continue;
+            }
+        };
+        // Tight synthetic book: bid 1c below mid, ask 1c above.
+        let yes_bid = (poly_yes_mid - 0.005).clamp(0.01, 0.99);
+        let yes_ask = (poly_yes_mid + 0.005).clamp(0.01, 0.99);
+        let no_bid = (1.0 - poly_yes_mid - 0.005).clamp(0.01, 0.99);
+        let no_ask = (1.0 - poly_yes_mid + 0.005).clamp(0.01, 0.99);
         let strat = decide(
             DecisionInputs {
                 market_id: &market_id,
-                fair_value: fv,
-                poly_yes_mid,
+                scoring_outcome: s_out,
+                poly_yes_bid: Some(yes_bid),
+                poly_yes_ask: Some(yes_ask),
+                poly_no_bid: Some(no_bid),
+                poly_no_ask: Some(no_ask),
                 ttr_secs: ttr,
                 max_per_trade_usd: cfg.risk.max_per_trade_usd,
             },
             &cfg.strategy,
         );
+        // Re-bind so the legacy `fv` variable shadow below stays valid
+        // for the existing logging without restructuring further.
+        let _ = fv;
         if let StrategyOutcome::Fire(sig) = strat {
             let mark = positions.get(&market_id).map(|pos| match pos.side {
                 Outcome::Yes => poly_yes_mid,

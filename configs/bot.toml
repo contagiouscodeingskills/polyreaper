@@ -6,13 +6,8 @@
 mode = "paper"
 
 [strategy]
-# Minimum |FV - poly_mid| (probability units) before a signal fires.
-# Must cover fees + spread + edge_threshold.
-min_edge = 0.02
-
-# Edge magnitude (prob units) at which sizing reaches max. Linear ramp
-# between min_edge and edge_scale.
-edge_scale = 0.08
+# Linear ramp scale for sizing — full size at (required_edge + edge_scale).
+edge_scale = 0.04
 
 # Refuse to trade when time-to-resolution is below this (seconds). Avoids
 # the freeze window and seconds where settlement is essentially certain.
@@ -21,10 +16,25 @@ min_ttr_secs = 15.0
 # Rolling window (seconds) for realised-vol estimation from Binance mids.
 vol_window_secs = 60.0
 
-# Fallback σ-per-second when the vol window hasn't filled yet. BTC
-# annualised vol ~50% → per-second ~3.5e-5; we use a slightly conservative
-# default.
+# Fallback σ-per-second when the vol window hasn't filled yet.
 fallback_sigma_per_sec = 5.0e-5
+
+# Polymarket crypto-market taker fee rate. Per-trade fee as fraction of
+# notional is taker_fee_rate * p * (1 - p), peaking at ~1.80% at p=0.5.
+# Verified May 2026; tune if Polymarket changes the schedule.
+taker_fee_rate = 0.072
+
+# Safety margin on top of fee-driven break-even edge. Probability units.
+# Covers model uncertainty, slippage, adverse selection.
+taker_safety_margin = 0.005
+
+# FV engine recompute cadence (ms). Strategy re-evaluates this often
+# independently of feed events. Smaller = more responsive + more log volume.
+fv_tick_ms = 100
+
+# Spread baseline (probability units) for normalising the spread feature.
+# 0.01 = 1c, typical Polymarket tick.
+spread_baseline = 0.01
 
 [risk]
 # Max USD spent on a single trade. v0 paper starts at $1.

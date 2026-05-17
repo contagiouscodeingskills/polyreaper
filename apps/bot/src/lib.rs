@@ -7,13 +7,16 @@
 //!
 //! ## Strategy
 //!
-//! One signal: `edge = fair_value(P_YES) − polymarket_mid`. Fair value
-//! comes from a Black-Scholes-like P(BTC_T > strike) with rolling realised
-//! σ from Binance bookTicker mids. Sizing scales with `|edge|`, gated by
-//! `min_edge` and `min_time_to_resolution`. There is no separate "lag"
-//! trigger — Polymarket's 2-4s repricing window naturally drives the edge
-//! to zero, so the signal fires inside that window and self-suppresses
-//! outside it.
+//! Fair value comes from a hand-coded multi-factor scoring model
+//! (`signals::scoring`) with per-regime weights. Default weights recover
+//! GBM-around-strike (Φ of the Z-score) as a special case; non-zero
+//! weights on book imbalance, drift, spread, etc. add corrections.
+//!
+//! The strategy fires as a taker only when `(scoring.p_yes - poly_yes_ask)`
+//! (or the NO equivalent) exceeds a fee-aware gate:
+//! `taker_fee_rate × p² × (1 − p) + safety_margin`. At the Polymarket
+//! peak (p=0.5, peak fee 1.80%) the gate is ~1.4¢; at the tails it
+//! drops to ~0.5–1¢. Most ticks therefore do not fire — by design.
 //!
 //! ## Modes
 //!
@@ -32,6 +35,7 @@ pub mod fv;
 pub mod market_state;
 pub mod position;
 pub mod risk;
+pub mod signals;
 pub mod strategy;
 
 // Re-export the demo entry so the `demo` binary can call it without

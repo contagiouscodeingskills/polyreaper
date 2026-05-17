@@ -9,6 +9,7 @@ pub struct BotConfig {
     pub strategy: StrategyConfig,
     pub risk: RiskConfig,
     pub feeds: FeedsConfig,
+    pub scoring: crate::signals::scoring::ScoringConfig,
 }
 
 /// Endpoints + polling cadences for the read-side feeds the bot consumes.
@@ -60,11 +61,9 @@ pub enum Mode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyConfig {
-    /// Minimum |FV - poly_mid| to fire a signal at all. Must cover fees
-    /// + spread + edge_threshold. Probability units (0..1).
-    pub min_edge: f64,
-    /// Edge magnitude that yields max-size sizing. Linear ramp from
-    /// `min_edge` (size ~ 0) to `edge_scale` (size = max). Probability units.
+    /// Linear ramp scale for size: a trade with edge equal to
+    /// `(required_edge + edge_scale)` fires at full `max_per_trade_usd`.
+    /// Probability units. Larger = harder to reach full size.
     pub edge_scale: f64,
     /// Refuse to trade if time-to-resolution is below this. Avoids the
     /// freeze window and the seconds where settlement is effectively
@@ -76,6 +75,27 @@ pub struct StrategyConfig {
     /// annualised vol ~50% → daily ~3% → per-second ~3.5e-5. We use a
     /// slightly conservative default.
     pub fallback_sigma_per_sec: f64,
+
+    /// Polymarket crypto-market taker fee rate. Fee as fraction of
+    /// notional is `taker_fee_rate × p × (1 − p)`, where `p` is the
+    /// share price. Default 0.072 → peak 1.80% at `p = 0.5`, dropping
+    /// to ~0.65% at `p = 0.1` or `p = 0.9` (verified against Polymarket
+    /// docs + third-party sources, May 2026).
+    pub taker_fee_rate: f64,
+    /// Additive safety margin on top of the fee-driven break-even edge.
+    /// Covers model uncertainty, slippage on fill, and adverse-selection
+    /// risk. Probability units. Default 0.005 (≈ half a cent).
+    pub taker_safety_margin: f64,
+
+    /// FV-engine timer cadence — strategy re-evaluates at this rate
+    /// independently of feed events. Smaller = more responsive +
+    /// more log volume.
+    pub fv_tick_ms: u64,
+
+    /// Spread baseline used to normalise the `yes_spread_normalized`
+    /// feature: `(observed_spread - baseline) / baseline`. Default 0.01
+    /// (1¢, the typical Polymarket tick).
+    pub spread_baseline: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +126,7 @@ impl Default for BotConfig {
             strategy: StrategyConfig::default(),
             risk: RiskConfig::default(),
             feeds: FeedsConfig::default(),
+            scoring: crate::signals::scoring::ScoringConfig::default(),
         }
     }
 }
@@ -151,11 +172,14 @@ impl Default for GammaSettings {
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
-            min_edge: 0.02,
-            edge_scale: 0.08,
+            edge_scale: 0.04,
             min_ttr_secs: 15.0,
             vol_window_secs: 60.0,
             fallback_sigma_per_sec: 5.0e-5,
+            taker_fee_rate: 0.072,
+            taker_safety_margin: 0.005,
+            fv_tick_ms: 100,
+            spread_baseline: 0.01,
         }
     }
 }
@@ -188,7 +212,8 @@ mod tests {
         let serialised = toml::to_string(&original).unwrap();
         let parsed = BotConfig::from_toml_str(&serialised).unwrap();
         assert_eq!(parsed.mode, original.mode);
-        assert_eq!(parsed.strategy.min_edge, original.strategy.min_edge);
+        assert_eq!(parsed.strategy.edge_scale, original.strategy.edge_scale);
+        assert_eq!(parsed.strategy.taker_fee_rate, original.strategy.taker_fee_rate);
         assert_eq!(
             parsed.risk.max_per_trade_usd,
             original.risk.max_per_trade_usd

@@ -1,271 +1,353 @@
-//! Strategy v0: edge = fair_value − polymarket_mid; size scales with edge.
+//! Strategy v1: scoring-driven taker with strict fee-aware edge gate.
+//!
+//! Takes a [`ScoringOutcome`] from `signals::scoring` plus the
+//! Polymarket top-of-book on both YES and NO sides, picks the best
+//! buy-side trade (highest expected-value after fees), gates it against
+//! the Polymarket fee curve + safety margin, and emits a `Signal`
+//! sized linearly with how much the edge exceeds the gate.
+//!
+//! Fee formula (Polymarket crypto markets, verified May 2026):
+//!   `fee_as_fraction_of_notional = taker_fee_rate × p × (1 − p)`
+//! Required edge (probability units) to break even taking at price `p`:
+//!   `required_edge = taker_fee_rate × p² × (1 − p) + safety_margin`
+//! See `docs/BOT_ARCHITECTURE_AND_BUILD_PLAN.md` §4 and the fee math
+//! in the changelog commits for the derivation.
 
 use market_registry::{MarketId, Outcome};
 use serde::{Deserialize, Serialize};
 
 use crate::config::StrategyConfig;
-use crate::fv::FairValue;
+use crate::signals::scoring::ScoringOutcome;
 
-/// Which side of the binary market a signal wants. Aliased so strategy
-/// code reads naturally; the underlying type is `market_registry::Outcome`.
-pub type Side = Outcome;
-
-/// A trade intent emitted by the strategy. Orders haven't been placed yet
-/// — risk gating + execution still need to consume this.
+/// A trade intent emitted by the strategy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Signal {
     pub market_id: MarketId,
     pub side: Outcome,
-    /// Target size in USD (max amount we're willing to spend on this fill).
+    /// Target USD size for this fill.
     pub size_usd: f64,
-    /// Target limit price in probability units (0..1) — the price of one
-    /// share of `side`. We aim to take liquidity at or better than this.
+    /// Price we'd actually fill at — the relevant side's ask.
     pub price: f64,
-    /// Fair value of `side` we computed. For audit / logging.
+    /// Fair-value for the chosen side at decision time.
     pub fv_for_side: f64,
-    /// Polymarket mid for `side` at decision time.
+    /// The Polymarket mid for the chosen side (diagnostic; we DON'T
+    /// trade against mid — we trade against ask).
     pub mid_for_side: f64,
-    /// Signed edge for `side` = `fv_for_side - mid_for_side`. Positive
-    /// means we think the side is undervalued.
+    /// Signed edge for the chosen side at the ask, after the fee gate.
     pub edge: f64,
-    /// Time-to-resolution at decision time, seconds.
     pub ttr_secs: f64,
 }
 
-/// Inputs to one decision tick. Caller assembles this per (market, snapshot).
+/// Inputs to one decision tick.
 #[derive(Debug, Clone)]
 pub struct DecisionInputs<'a> {
     pub market_id: &'a MarketId,
-    pub fair_value: FairValue,
-    /// Polymarket YES-side mid in [0,1].
-    pub poly_yes_mid: f64,
-    /// Seconds until market resolution.
+    pub scoring_outcome: ScoringOutcome,
+    pub poly_yes_bid: Option<f64>,
+    pub poly_yes_ask: Option<f64>,
+    pub poly_no_bid: Option<f64>,
+    pub poly_no_ask: Option<f64>,
     pub ttr_secs: f64,
-    /// Max USD we'd spend if conviction is full.
     pub max_per_trade_usd: f64,
 }
 
 /// Outcome of one strategy tick.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrategyOutcome {
-    /// Strategy wants to fire.
     Fire(Signal),
-    /// Strategy explicitly declined to fire. Carries the reason so it can
-    /// be logged for diagnostics.
     NoSignal(NoSignalReason),
 }
 
-/// Why the strategy chose not to emit a signal. Serialises as a short
-/// snake_case string for the decision log.
+/// Why the strategy chose not to fire. Serialised for the decision log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoSignalReason {
-    /// Time-to-resolution below the configured floor (freeze window).
+    /// `ttr_secs` below configured floor.
     TtrBelowMin,
-    /// Polymarket mid was outside `[0,1]` — venue glitch or missing data.
-    PolyMidOutOfRange,
-    /// `|FV - poly_mid|` was below `min_edge` (not worth fees + spread).
-    EdgeBelowMin,
-    /// Sizing computed to non-positive — defensive guard.
+    /// Missing YES or NO ask price.
+    PolyAskMissing,
+    /// Ask price outside `(0, 1)` — venue glitch.
+    PolyAskOutOfRange,
+    /// Edge on best side didn't clear the fee + safety gate.
+    EdgeBelowGate,
+    /// Sized to non-positive — defensive guard.
     SizeNonPositive,
 }
 
-/// Pure function: given the inputs and config, emit a `Fire(signal)` or
-/// `NoSignal(reason)`. Caller logs the reason for diagnostics.
+/// One side's candidate buy: ask price + edge after subtracting ask.
+struct SideCandidate {
+    side: Outcome,
+    ask: f64,
+    fv: f64,
+    edge_after_ask: f64,
+}
+
+/// Required edge (probability units) to break even taking at price `p`
+/// given the Polymarket crypto fee curve. Plus safety margin.
+fn required_edge(p: f64, cfg: &StrategyConfig) -> f64 {
+    cfg.taker_fee_rate * p * p * (1.0 - p) + cfg.taker_safety_margin
+}
+
+/// Pure function: from scoring outcome + book + config, emit a fire or
+/// a labeled no-signal.
 pub fn decide(inputs: DecisionInputs<'_>, cfg: &StrategyConfig) -> StrategyOutcome {
     if !inputs.ttr_secs.is_finite() || inputs.ttr_secs < cfg.min_ttr_secs {
         return StrategyOutcome::NoSignal(NoSignalReason::TtrBelowMin);
     }
-    if !(0.0..=1.0).contains(&inputs.poly_yes_mid) {
-        return StrategyOutcome::NoSignal(NoSignalReason::PolyMidOutOfRange);
+
+    // Build both candidates. Missing asks → side is ineligible.
+    let yes_cand = match inputs.poly_yes_ask {
+        Some(a) if (0.0..=1.0).contains(&a) => Some(SideCandidate {
+            side: Outcome::Yes,
+            ask: a,
+            fv: inputs.scoring_outcome.p_yes,
+            edge_after_ask: inputs.scoring_outcome.p_yes - a,
+        }),
+        Some(_) => return StrategyOutcome::NoSignal(NoSignalReason::PolyAskOutOfRange),
+        None => None,
+    };
+    let no_cand = match inputs.poly_no_ask {
+        Some(a) if (0.0..=1.0).contains(&a) => Some(SideCandidate {
+            side: Outcome::No,
+            ask: a,
+            fv: inputs.scoring_outcome.p_no,
+            edge_after_ask: inputs.scoring_outcome.p_no - a,
+        }),
+        Some(_) => return StrategyOutcome::NoSignal(NoSignalReason::PolyAskOutOfRange),
+        None => None,
+    };
+
+    let candidates: Vec<SideCandidate> = [yes_cand, no_cand].into_iter().flatten().collect();
+    if candidates.is_empty() {
+        return StrategyOutcome::NoSignal(NoSignalReason::PolyAskMissing);
     }
-    let yes_edge = inputs.fair_value.p_yes - inputs.poly_yes_mid;
-    let abs_edge = yes_edge.abs();
-    if abs_edge < cfg.min_edge {
-        return StrategyOutcome::NoSignal(NoSignalReason::EdgeBelowMin);
+
+    // Best side = largest edge after ask. Fire only if it clears the gate.
+    let best = candidates
+        .into_iter()
+        .max_by(|a, b| {
+            a.edge_after_ask
+                .partial_cmp(&b.edge_after_ask)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("non-empty");
+
+    let required = required_edge(best.ask, cfg);
+    if best.edge_after_ask <= required {
+        return StrategyOutcome::NoSignal(NoSignalReason::EdgeBelowGate);
     }
-    let scale =
-        ((abs_edge - cfg.min_edge) / (cfg.edge_scale - cfg.min_edge)).clamp(0.0, 1.0);
+
+    // Size by how much we beat the gate.
+    let excess = best.edge_after_ask - required;
+    let scale = (excess / cfg.edge_scale).clamp(0.0, 1.0);
     let size_usd = inputs.max_per_trade_usd * scale;
     if size_usd <= 0.0 {
         return StrategyOutcome::NoSignal(NoSignalReason::SizeNonPositive);
     }
-    let (side, fv_for_side, mid_for_side, edge) = if yes_edge > 0.0 {
-        (
-            Outcome::Yes,
-            inputs.fair_value.p_yes,
-            inputs.poly_yes_mid,
-            yes_edge,
-        )
-    } else {
-        (
-            Outcome::No,
-            inputs.fair_value.p_no,
-            1.0 - inputs.poly_yes_mid,
-            -yes_edge,
-        )
+
+    let bid_for_side = match best.side {
+        Outcome::Yes => inputs.poly_yes_bid,
+        Outcome::No => inputs.poly_no_bid,
     };
+    let mid_for_side = match (bid_for_side, Some(best.ask)) {
+        (Some(b), Some(a)) if a > b => 0.5 * (a + b),
+        _ => best.ask,
+    };
+
     StrategyOutcome::Fire(Signal {
         market_id: inputs.market_id.clone(),
-        side,
+        side: best.side,
         size_usd,
-        price: mid_for_side,
-        fv_for_side,
+        price: best.ask,
+        fv_for_side: best.fv,
         mid_for_side,
-        edge,
+        edge: best.edge_after_ask,
         ttr_secs: inputs.ttr_secs,
     })
+}
+
+/// Diagnostic: what's the required edge at this price, given config?
+/// Exposed so the decision log can record what the gate was for each tick.
+pub fn taker_required_edge(price: f64, cfg: &StrategyConfig) -> f64 {
+    required_edge(price, cfg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StrategyConfig;
-    use crate::fv::FairValue;
+    use crate::signals::scoring::ScoringOutcome;
 
-    fn ctx() -> (MarketId, StrategyConfig) {
-        (MarketId::new("M"), StrategyConfig::default())
+    fn cfg() -> StrategyConfig {
+        StrategyConfig::default()
     }
 
-    fn expect_fire(outcome: StrategyOutcome) -> Signal {
-        match outcome {
+    fn scoring(p_yes: f64) -> ScoringOutcome {
+        ScoringOutcome {
+            p_yes,
+            p_no: 1.0 - p_yes,
+            raw: 0.0,
+        }
+    }
+
+    fn inputs<'a>(
+        market: &'a MarketId,
+        p_yes: f64,
+        yes_ask: f64,
+        no_ask: f64,
+    ) -> DecisionInputs<'a> {
+        DecisionInputs {
+            market_id: market,
+            scoring_outcome: scoring(p_yes),
+            poly_yes_bid: Some(yes_ask - 0.01),
+            poly_yes_ask: Some(yes_ask),
+            poly_no_bid: Some(no_ask - 0.01),
+            poly_no_ask: Some(no_ask),
+            ttr_secs: 120.0,
+            max_per_trade_usd: 1.0,
+        }
+    }
+
+    fn expect_fire(o: StrategyOutcome) -> Signal {
+        match o {
             StrategyOutcome::Fire(s) => s,
             StrategyOutcome::NoSignal(r) => panic!("expected fire, got NoSignal({r:?})"),
         }
     }
-
-    fn expect_no_signal(outcome: StrategyOutcome) -> NoSignalReason {
-        match outcome {
+    fn expect_no(o: StrategyOutcome) -> NoSignalReason {
+        match o {
             StrategyOutcome::NoSignal(r) => r,
             StrategyOutcome::Fire(s) => panic!("expected NoSignal, got Fire({s:?})"),
         }
     }
 
     #[test]
-    fn no_signal_below_min_edge() {
-        let (m, cfg) = ctx();
-        let out = decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.51),
-                poly_yes_mid: 0.50,
-                ttr_secs: 120.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        );
-        assert_eq!(expect_no_signal(out), NoSignalReason::EdgeBelowMin);
+    fn ttr_below_min_blocks() {
+        let m = MarketId::new("M");
+        let mut i = inputs(&m, 0.6, 0.5, 0.5);
+        i.ttr_secs = 5.0;
+        assert_eq!(expect_no(decide(i, &cfg())), NoSignalReason::TtrBelowMin);
     }
 
     #[test]
-    fn no_signal_in_freeze_window() {
-        let (m, cfg) = ctx();
-        let out = decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.70),
-                poly_yes_mid: 0.50,
-                ttr_secs: 5.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        );
-        assert_eq!(expect_no_signal(out), NoSignalReason::TtrBelowMin);
+    fn at_strike_with_small_edge_does_not_fire() {
+        // scoring p_yes = 0.50 + 0.5%; yes_ask = 0.50. Edge = 0.005.
+        // Required at p=0.5: 0.072 × 0.25 × 0.5 + 0.005 = 0.014. Below gate.
+        let m = MarketId::new("M");
+        let out = decide(inputs(&m, 0.505, 0.50, 0.50), &cfg());
+        assert_eq!(expect_no(out), NoSignalReason::EdgeBelowGate);
     }
 
     #[test]
-    fn no_signal_when_poly_mid_out_of_range() {
-        let (m, cfg) = ctx();
-        let out = decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.5),
-                poly_yes_mid: 1.5,
-                ttr_secs: 120.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        );
-        assert_eq!(expect_no_signal(out), NoSignalReason::PolyMidOutOfRange);
-    }
-
-    #[test]
-    fn fires_yes_when_fv_above_mid() {
-        let (m, cfg) = ctx();
-        let sig = expect_fire(decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.60),
-                poly_yes_mid: 0.50,
-                ttr_secs: 120.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        ));
+    fn fires_yes_when_edge_clears_gate() {
+        // p_yes = 0.58, yes_ask = 0.50 → edge = 0.08 > 0.014 required.
+        let m = MarketId::new("M");
+        let sig = expect_fire(decide(inputs(&m, 0.58, 0.50, 0.50), &cfg()));
         assert_eq!(sig.side, Outcome::Yes);
+        assert!((sig.price - 0.50).abs() < 1e-9);
         assert!(sig.size_usd > 0.0 && sig.size_usd <= 1.0);
-        assert!((sig.edge - 0.10).abs() < 1e-9);
     }
 
     #[test]
-    fn fires_no_when_fv_below_mid() {
-        let (m, cfg) = ctx();
-        let sig = expect_fire(decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.40),
-                poly_yes_mid: 0.50,
-                ttr_secs: 120.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        ));
+    fn fires_no_when_no_edge_clears_gate() {
+        // p_yes = 0.20 → p_no = 0.80; no_ask = 0.55. NO edge = 0.25.
+        let m = MarketId::new("M");
+        let sig = expect_fire(decide(inputs(&m, 0.20, 0.95, 0.55), &cfg()));
         assert_eq!(sig.side, Outcome::No);
-        assert!((sig.edge - 0.10).abs() < 1e-9);
-        assert!((sig.fv_for_side - 0.60).abs() < 1e-9);
-        assert!((sig.mid_for_side - 0.50).abs() < 1e-9);
+        assert!((sig.price - 0.55).abs() < 1e-9);
     }
 
     #[test]
-    fn size_scales_with_edge() {
-        let (m, cfg) = ctx();
-        let s_small = expect_fire(decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.53),
-                poly_yes_mid: 0.50,
-                ttr_secs: 120.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        ));
-        let s_big = expect_fire(decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.60),
-                poly_yes_mid: 0.50,
-                ttr_secs: 120.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        ));
-        assert!(s_big.size_usd > s_small.size_usd);
-        assert!(s_big.size_usd <= 1.0);
+    fn picks_higher_edge_side_when_both_clear() {
+        // p_yes = 0.62, yes_ask = 0.40 → yes_edge = 0.22.
+        // p_no = 0.38, no_ask = 0.30 → no_edge = 0.08.
+        // YES wins.
+        let m = MarketId::new("M");
+        let sig = expect_fire(decide(inputs(&m, 0.62, 0.40, 0.30), &cfg()));
+        assert_eq!(sig.side, Outcome::Yes);
     }
 
     #[test]
-    fn size_caps_at_full_at_or_above_edge_scale() {
-        let (m, cfg) = ctx();
-        let sig = expect_fire(decide(
-            DecisionInputs {
-                market_id: &m,
-                fair_value: FairValue::from_p_yes(0.20),
-                poly_yes_mid: 0.50,
-                ttr_secs: 120.0,
-                max_per_trade_usd: 1.0,
-            },
-            &cfg,
-        ));
-        assert!((sig.size_usd - 1.0).abs() < 1e-9);
+    fn required_edge_matches_break_even_math() {
+        // required = taker_fee_rate × p² × (1 − p) + safety_margin.
+        // (Derivation: buying YES at p has 1/p shares per $; fee per $
+        // = fee_rate × p × (1-p); required true edge to break even =
+        // fee_rate × p² × (1-p).)
+        let c = cfg();
+        let expected = |p: f64| c.taker_fee_rate * p * p * (1.0 - p) + c.taker_safety_margin;
+        for p in [0.10, 0.30, 0.50, 0.67, 0.90] {
+            assert!((taker_required_edge(p, &c) - expected(p)).abs() < 1e-12, "p={p}");
+        }
+    }
+
+    #[test]
+    fn required_edge_peaks_near_two_thirds() {
+        // p²(1-p) is maximised at p = 2/3 (d/dp = 2p − 3p² = 0). The
+        // asymmetry is real: expensive YES costs more in absolute edge
+        // because of leverage, not because the venue is asymmetric.
+        let c = cfg();
+        let at_half = taker_required_edge(0.50, &c);
+        let at_two_thirds = taker_required_edge(2.0 / 3.0, &c);
+        let at_low = taker_required_edge(0.10, &c);
+        let at_high = taker_required_edge(0.90, &c);
+        assert!(at_two_thirds > at_half);
+        assert!(at_two_thirds > at_high);
+        assert!(at_half > at_low);
+        // The asymmetry is the point: at_high should be GREATER than at_low.
+        assert!(at_high > at_low);
+    }
+
+    #[test]
+    fn missing_ask_rejects_with_labeled_reason() {
+        let m = MarketId::new("M");
+        let i = DecisionInputs {
+            market_id: &m,
+            scoring_outcome: scoring(0.7),
+            poly_yes_bid: None,
+            poly_yes_ask: None,
+            poly_no_bid: None,
+            poly_no_ask: None,
+            ttr_secs: 120.0,
+            max_per_trade_usd: 1.0,
+        };
+        assert_eq!(expect_no(decide(i, &cfg())), NoSignalReason::PolyAskMissing);
+    }
+
+    #[test]
+    fn ask_out_of_range_rejected() {
+        let m = MarketId::new("M");
+        let mut i = inputs(&m, 0.7, 0.5, 0.5);
+        i.poly_yes_ask = Some(1.5);
+        assert_eq!(
+            expect_no(decide(i, &cfg())),
+            NoSignalReason::PolyAskOutOfRange
+        );
+    }
+
+    #[test]
+    fn size_scales_with_edge_over_gate() {
+        let m = MarketId::new("M");
+        let c = cfg();
+        // Small edge above gate → small size.
+        let small = expect_fire(decide(inputs(&m, 0.516, 0.50, 0.50), &c));
+        // Large edge above gate → larger size, capped at max.
+        let large = expect_fire(decide(inputs(&m, 0.70, 0.50, 0.50), &c));
+        assert!(large.size_usd > small.size_usd);
+        assert!(large.size_usd <= 1.0);
+    }
+
+    #[test]
+    fn deep_otm_lower_fee_lets_smaller_edge_fire() {
+        // At p = 0.10 the required edge is much smaller, so smaller edges can fire.
+        let m = MarketId::new("M");
+        let c = cfg();
+        // p_yes = 0.13, yes_ask = 0.10 → edge = 0.03.
+        // Required at 0.10: 0.072 * 0.01 * 0.9 + 0.005 = 0.00565. 0.03 > 0.005. Fires.
+        let _ = expect_fire(decide(inputs(&m, 0.13, 0.10, 0.95), &c));
+        // Same edge magnitude at ATM (p_yes=0.53, ask=0.50) → 0.03 vs required ~0.014.
+        // Both fire but the OTM one fires at a smaller threshold.
+        let small_atm = expect_fire(decide(inputs(&m, 0.53, 0.50, 0.50), &c));
+        // Sanity: the size for an OTM 3-cent edge should be larger relative to its gate
+        // than the same nominal edge at ATM. (Both fire; that's what we're testing.)
+        assert!(small_atm.size_usd > 0.0);
     }
 }

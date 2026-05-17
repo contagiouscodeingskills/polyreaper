@@ -23,7 +23,7 @@ use crate::config::BotConfig;
 use crate::risk::RejectReason;
 use crate::strategy::NoSignalReason;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Record
@@ -85,6 +85,30 @@ pub struct DecisionRecord {
 
     // Time-bucket label derived from ttr_secs at write time.
     pub time_bucket: Option<String>,
+
+    // Scoring model output (signal 2). `p_yes`/`p_no` come from the
+    // hand-coded multi-factor scoring config; `raw` is the pre-Φ linear
+    // combination (diagnostic).
+    pub scoring_p_yes: Option<f64>,
+    pub scoring_p_no: Option<f64>,
+    pub scoring_raw: Option<f64>,
+    pub scoring_regime: Option<String>,
+
+    // Per-feature values fed to scoring (post-normalisation, in std-dev
+    // or ratio units). Logged so we can attribute scoring output to
+    // individual features in offline analysis.
+    pub feat_btc_strike_distance_z: Option<f64>,
+    pub feat_btc_drift_5s_z: Option<f64>,
+    pub feat_btc_drift_30s_z: Option<f64>,
+    pub feat_btc_drift_60s_z: Option<f64>,
+    pub feat_yes_book_imbalance: Option<f64>,
+    pub feat_no_book_imbalance: Option<f64>,
+    pub feat_yes_spread_normalized: Option<f64>,
+
+    // Fee-aware taker gate diagnostics. Required edge to break even at
+    // each side's ask, given the Polymarket fee curve + safety margin.
+    pub taker_required_edge_yes: Option<f64>,
+    pub taker_required_edge_no: Option<f64>,
 
     // Cross-venue strike diagnostics (the open question — see memory
     // entry "Cross-venue strike open question").
@@ -332,6 +356,19 @@ mod tests {
             sigma_per_sec_60s: None,
             sigma_per_sec_300s: None,
             time_bucket: None,
+            scoring_p_yes: None,
+            scoring_p_no: None,
+            scoring_raw: None,
+            scoring_regime: None,
+            feat_btc_strike_distance_z: None,
+            feat_btc_drift_5s_z: None,
+            feat_btc_drift_30s_z: None,
+            feat_btc_drift_60s_z: None,
+            feat_yes_book_imbalance: None,
+            feat_no_book_imbalance: None,
+            feat_yes_spread_normalized: None,
+            taker_required_edge_yes: None,
+            taker_required_edge_no: None,
             implied_strike_usd: None,
             strike_gap_usd: None,
             strike_gap_bps: None,
