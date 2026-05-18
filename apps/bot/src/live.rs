@@ -37,6 +37,8 @@
 //! will panic-bail before any feed is opened. The intent is **loud
 //! failure**: no silent fallback to paper.
 
+pub mod signing;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

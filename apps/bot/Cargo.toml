@@ -36,4 +36,13 @@ tokio-tungstenite  = { workspace = true }
 futures-util       = { workspace = true }
 reqwest            = { workspace = true }
 
+# Live-trading crypto.
+k256               = { workspace = true }
+sha3               = { workspace = true }
+sha2               = { workspace = true }
+hmac               = { workspace = true }
+base64             = { workspace = true }
+hex                = { workspace = true }
+rand               = { workspace = true }
+
 [dev-dependencies]

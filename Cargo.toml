@@ -53,6 +53,16 @@ arrow              = { version = "53", default-features = false }
 parquet            = { version = "53", default-features = false, features = ["arrow", "snap"] }
 flate2             = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# Live-trading crypto (Polymarket CLOB v2). EIP-712 + HMAC-SHA256.
+# Kept minimal — full `alloy` stack would balloon the dep tree.
+k256               = { version = "0.13", features = ["ecdsa"] }
+sha3               = "0.10"
+sha2               = "0.10"
+hmac               = "0.12"
+base64             = "0.22"
+hex                = "0.4"
+rand               = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
