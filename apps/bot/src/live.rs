@@ -138,13 +138,21 @@ impl LiveCredentials {
         })
     }
 
-    /// For tests that want to exercise the constructor without setting env.
+    /// Construct from raw strings. Prefer [`Self::from_env`] in
+    /// production so keys are never embedded in code. Exposed publicly
+    /// so integration tests (and any future config-file-driven path)
+    /// can build credentials without going through env vars.
+    pub fn new(eoa_private_key: impl Into<String>, proxy_wallet_address: impl Into<String>) -> Self {
+        Self {
+            eoa_private_key: eoa_private_key.into(),
+            proxy_wallet_address: proxy_wallet_address.into(),
+        }
+    }
+
+    /// Back-compat alias for in-crate tests.
     #[cfg(test)]
     pub fn for_test(key: &str, addr: &str) -> Self {
-        Self {
-            eoa_private_key: key.into(),
-            proxy_wallet_address: addr.into(),
-        }
+        Self::new(key, addr)
     }
 
     /// Proxy wallet address — safe to log (public on-chain identifier).

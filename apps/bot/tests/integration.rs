@@ -18,7 +18,8 @@ use bot::bot::check_data_quality;
 use bot::config::{RiskConfig, StrategyConfig};
 use bot::decision_log::{DecisionKind, DecisionRecord, IncompleteReason, SCHEMA_VERSION};
 use bot::execution::PaperExecutor;
-use bot::live::{reconcile, LiveOrder, LiveOrderId, OrderState};
+use bot::live::{reconcile, LiveCredentials, LiveExecutor, LiveOrder, LiveOrderId, MarketContext, OrderState};
+use bot::live::client::ApiCredentials;
 use bot::metrics::{DecisionKindMetric, MetricsRegistry, MetricsSnapshot};
 use bot::position::PositionStore;
 use bot::risk::{RejectReason, RiskDecision, RiskEngine};
@@ -637,3 +638,147 @@ fn metrics_registry_renders_full_bot_state() {
     assert!(text.contains("bot_decisions_total{kind=\"fire\"} 4"));
     assert!(text.contains("bot_realised_pnl_per_market_usd{market_id=\"ma\"} -25"));
 }
+
+// ---------------------------------------------------------------------------
+// Live executor end-to-end: a Signal driven through the executor lands
+// on the wire as a signed POST, the response promotes the order to
+// Acked, and a follow-up reconcile call from a second mock terminates
+// it cleanly.
+// ---------------------------------------------------------------------------
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+async fn read_full_http_request(socket: &mut tokio::net::TcpStream) -> (String, String) {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = socket.read(&mut tmp).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let cl: usize = head
+                .lines()
+                .find_map(|l| {
+                    let mut s = l.splitn(2, ':');
+                    let (n, v) = (s.next()?.trim(), s.next()?.trim());
+                    if n.eq_ignore_ascii_case("content-length") {
+                        v.parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            while buf.len() < pos + 4 + cl {
+                let m = socket.read(&mut tmp).await.unwrap();
+                if m == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..m]);
+            }
+            let body = String::from_utf8_lossy(&buf[pos + 4..]).to_string();
+            let req_line = head.lines().next().unwrap_or("").to_string();
+            return (req_line, body);
+        }
+    }
+    (String::new(), String::new())
+}
+
+fn http_ok_body(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes()
+}
+
+const TEST_EOA_KEY: &str =
+    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const TEST_PROXY_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+fn test_api_creds() -> ApiCredentials {
+    use base64::engine::general_purpose::URL_SAFE as B64URL;
+    use base64::Engine;
+    ApiCredentials {
+        api_key: "key".into(),
+        secret_b64url: B64URL.encode(b"secret-bytes-32-aaaaaaaaaaaaaaaa"),
+        passphrase: "pass".into(),
+    }
+}
+
+#[tokio::test]
+async fn live_executor_submits_signed_order_and_reconciles_to_terminal_state() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Mock server handles two requests in sequence:
+    //   1. POST /order — returns orderID "0xLIVE1"
+    //   2. GET  /data/orders — returns one entry showing FILLED state
+    let server = tokio::spawn(async move {
+        // First request: the submit.
+        let (mut sock1, _) = listener.accept().await.unwrap();
+        let (req_line, body) = read_full_http_request(&mut sock1).await;
+        assert!(req_line.starts_with("POST /order"), "got: {req_line}");
+        // Body parses as a SignedOrderRequest with side=BUY and the YES token.
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["order"]["side"].as_str(), Some("BUY"));
+        assert_eq!(v["order"]["tokenId"].as_str(), Some("71321045679252212594626385532"));
+        let resp = http_ok_body(r#"{"success":true,"errorMsg":"","orderID":"0xLIVE1"}"#);
+        sock1.write_all(&resp).await.unwrap();
+        sock1.shutdown().await.ok();
+
+        // Second request: the reconciliation fetch.
+        let (mut sock2, _) = listener.accept().await.unwrap();
+        let (req_line, _) = read_full_http_request(&mut sock2).await;
+        assert!(req_line.starts_with("GET /data/orders"), "got: {req_line}");
+        let resp_body = r#"{"data":[{"id":"0xLIVE1","status":"FILLED","market":"M1","side":"BUY","price":"0.50","original_size":"10","size_matched":"10","asset_id":"71321045679252212594626385532"}],"next_cursor":"LTE="}"#;
+        sock2.write_all(&http_ok_body(resp_body)).await.unwrap();
+        sock2.shutdown().await.ok();
+    });
+
+    let creds = LiveCredentials::new(TEST_EOA_KEY, TEST_PROXY_ADDR);
+    let mut exec =
+        LiveExecutor::new(Some(creds), Some(test_api_creds()), format!("http://{addr}"))
+            .unwrap();
+
+    // Submit a Signal — picks YES side / 71321045679252212594626385532 by virtue of signal.side.
+    let signal = Signal {
+        market_id: MarketId::new("M1"),
+        side: Outcome::Yes,
+        size_usd: 5.0,
+        price: 0.50,
+        fv_for_side: 0.60,
+        mid_for_side: 0.50,
+        edge: 0.10,
+        ttr_secs: 120.0,
+    };
+    let ctx = MarketContext {
+        yes_token_id: "71321045679252212594626385532".into(),
+        no_token_id: "52341098765432109876543210987".into(),
+        neg_risk: false,
+        fee_rate_bps: 0,
+        chain_id: 137,
+    };
+    let id = exec.submit(signal, &ctx).await.expect("submit ok");
+    assert_eq!(id.as_str(), "0xLIVE1");
+    assert_eq!(exec.open_count(), 1);
+
+    // Reconcile: fetch venue view, diff against local, apply.
+    let local = exec.open_orders();
+    let venue = exec
+        .fetch_open_orders_from_venue()
+        .await
+        .expect("fetch ok");
+    let diff = reconcile(&local, &venue);
+    assert_eq!(diff.updates.len(), 1);
+    assert_eq!(diff.updates[0].new_state, OrderState::Filled);
+    exec.apply_diff(diff);
+    // Filled is terminal → drops from open book.
+    assert_eq!(exec.open_count(), 0);
+
+    server.await.unwrap();
+}
+

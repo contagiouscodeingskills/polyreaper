@@ -11,10 +11,9 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use bot::bot::run_paper;
+use bot::bot::{run_live, run_paper};
 use bot::config::BotConfig;
-use bot::live::client::ApiCredentials;
-use bot::live::{LiveCredentials, LiveExecError, LiveExecutor};
+use bot::live::LiveExecError;
 
 #[tokio::main]
 async fn main() {
@@ -22,65 +21,49 @@ async fn main() {
 
     let cfg = load_config();
 
-    // Live mode is gated behind credentials being present. We fail
-    // loudly here rather than silently falling back to paper — a
-    // misconfigured live deployment that quietly runs paper is the
-    // worst possible failure mode (the user thinks they're trading
-    // and isn't).
-    if cfg.mode == bot::config::Mode::Live {
-        match LiveExecutor::new(
-            LiveCredentials::from_env(),
-            ApiCredentials::from_env(),
-            cfg.feeds.polymarket.clob_url.clone(),
-        ) {
-            Ok(exec) => {
-                info!(
-                    signer = %exec.signer_address_hex(),
-                    proxy = %exec.proxy_wallet_address(),
-                    "Mode::Live: credentials present and live executor initialised"
-                );
-                // `run_live` orchestration is the next step (Phase B);
-                // until that lands the bot must NOT silently fall back
-                // to paper.
-                warn!(
-                    "Mode::Live: executor ready but the live orchestrator \
-                     (`run_live`) is not yet wired. Refusing to start."
-                );
-                std::process::exit(2);
-            }
-            Err(LiveExecError::CredentialsMissing) => {
-                warn!(
-                    "Mode::Live but POLYMARKET_EOA_PRIVATE_KEY / \
-                     POLYMARKET_PROXY_WALLET_ADDRESS are not set. Refusing to \
-                     start (silent paper fallback would be unsafe)."
-                );
-                std::process::exit(2);
-            }
-            Err(LiveExecError::ApiCredentialsMissing) => {
-                warn!(
-                    "Mode::Live but POLYMARKET_API_KEY / POLYMARKET_API_SECRET / \
-                     POLYMARKET_API_PASSPHRASE are not set. Run \
-                     `py-clob-client` (or equivalent) once with your EOA key \
-                     to mint these, then set them in the environment."
-                );
-                std::process::exit(2);
-            }
-            Err(e) => {
-                warn!(error = %e, "live executor failed to initialise");
-                std::process::exit(2);
-            }
-        }
-    }
-
     info!(
         binance_url = %cfg.feeds.binance.ws_url,
         gamma_url = %cfg.feeds.gamma.url,
         clob_url = %cfg.feeds.polymarket.clob_url,
         series = %cfg.feeds.gamma.series_slug,
+        mode = ?cfg.mode,
         "configured endpoints"
     );
 
-    run_paper(cfg).await;
+    match cfg.mode {
+        bot::config::Mode::Paper => {
+            run_paper(cfg).await;
+        }
+        bot::config::Mode::Live => {
+            // Live mode requires BOTH the EOA + proxy creds AND the
+            // L2 HMAC API creds (POLY_API_KEY/SECRET/PASSPHRASE).
+            // Failure is loud — silent paper fallback would be unsafe.
+            match run_live(cfg).await {
+                Ok(()) => {}
+                Err(LiveExecError::CredentialsMissing) => {
+                    warn!(
+                        "Mode::Live but POLYMARKET_EOA_PRIVATE_KEY / \
+                         POLYMARKET_PROXY_WALLET_ADDRESS are not set. \
+                         Refusing to start (silent paper fallback would be unsafe)."
+                    );
+                    std::process::exit(2);
+                }
+                Err(LiveExecError::ApiCredentialsMissing) => {
+                    warn!(
+                        "Mode::Live but POLYMARKET_API_KEY / POLYMARKET_API_SECRET / \
+                         POLYMARKET_API_PASSPHRASE are not set. Run \
+                         `py-clob-client` (or equivalent) once with your EOA key \
+                         to mint these, then set them in the environment."
+                    );
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    warn!(error = %e, "live executor failed to initialise");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
 }
 
 fn init_tracing() {

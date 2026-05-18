@@ -7,12 +7,13 @@
 //! `DecisionRecord` per evaluation tick into `decisions.ndjson` for
 //! durable audit.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use market_registry::{Market, MarketId, Outcome};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tracing::{info, warn};
 
 use crate::config::BotConfig;
@@ -102,6 +103,87 @@ fn build_session_paths(now_secs: i64) -> SessionPaths {
 /// Run the bot in paper mode against live feeds. Spawns the Binance and
 /// Polymarket tasks, then drives the strategy loop.
 pub async fn run_paper(cfg: BotConfig) {
+    run_bot(cfg, None).await
+}
+
+/// Run the bot against the real Polymarket CLOB. Requires both
+/// `LiveCredentials` (EOA + proxy) and `client::ApiCredentials` (HMAC)
+/// in the environment.
+///
+/// Mostly the same orchestration as `run_paper`, plus:
+/// * Constructs a shared [`crate::live::LiveExecutor`] and threads it
+///   into `BotState` via `set_live_mode`. The strategy fire path then
+///   submits real signed orders instead of paper fills.
+/// * Spawns a reconciliation task that polls open orders every 5
+///   seconds and applies the diff back to the executor's local view.
+///
+/// Settlement of resolved positions still flows through the existing
+/// resolution sweeper + paper-style P&L recording. Real on-chain
+/// settlement verification is a v2 task — see `live.rs` module docs.
+pub async fn run_live(cfg: BotConfig) -> Result<(), crate::live::LiveExecError> {
+    let live = crate::live::LiveExecutor::new(
+        crate::live::LiveCredentials::from_env(),
+        crate::live::client::ApiCredentials::from_env(),
+        cfg.feeds.polymarket.clob_url.clone(),
+    )?;
+    info!(
+        signer = %live.signer_address_hex(),
+        proxy = %live.proxy_wallet_address(),
+        "live executor initialised"
+    );
+    let live = Arc::new(AsyncMutex::new(live));
+
+    // Reconciliation task — runs forever (or until the executor is
+    // dropped). Locks the executor briefly to fetch + apply diffs;
+    // submits in the main loop must wait while this runs.
+    let recon = live.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // skip immediate
+        loop {
+            ticker.tick().await;
+            // Snapshot local view under the lock.
+            let local_orders = {
+                let guard = recon.lock().await;
+                guard.open_orders()
+            };
+            if local_orders.is_empty() {
+                continue;
+            }
+            // Fetch venue view (holds the lock for the network round-trip).
+            let venue_orders = {
+                let guard = recon.lock().await;
+                match guard.fetch_open_orders_from_venue().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "reconcile: fetch_open_orders failed");
+                        continue;
+                    }
+                }
+            };
+            // Pure diff outside the lock.
+            let diff = crate::live::reconcile(&local_orders, &venue_orders);
+            if !diff.updates.is_empty() {
+                let mut guard = recon.lock().await;
+                let updates = diff.updates.len();
+                guard.apply_diff(diff);
+                info!(event = "reconcile_applied", updates, "reconciler applied diff");
+            }
+        }
+    });
+
+    run_bot(cfg, Some(live)).await;
+    Ok(())
+}
+
+/// Inner orchestrator shared by both modes. `live_executor` is `Some`
+/// in live mode; the main fire path then awaits it instead of using
+/// the in-memory paper executor.
+async fn run_bot(
+    cfg: BotConfig,
+    live_executor: Option<Arc<AsyncMutex<crate::live::LiveExecutor>>>,
+) {
     let now_s_int = now_epoch_secs_i64();
     let paths = build_session_paths(now_s_int);
     info!(
@@ -249,6 +331,10 @@ pub async fn run_paper(cfg: BotConfig) {
         initial_bankroll,
         metrics,
     );
+    if let Some(live) = live_executor.as_ref() {
+        state.set_live_mode(live.clone());
+        info!("bot state switched to live mode — strategy fires submit to CLOB");
+    }
 
     let mut status_ticker = tokio::time::interval(Duration::from_secs(30));
     status_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -274,7 +360,7 @@ pub async fn run_paper(cfg: BotConfig) {
                 }
             }
             _ = fv_ticker.tick() => {
-                state.evaluate_and_log(now_epoch_secs_f64());
+                state.evaluate_and_log(now_epoch_secs_f64()).await;
             }
             _ = status_ticker.tick() => {
                 state.emit_status();
@@ -366,6 +452,26 @@ struct BotState {
     /// Prometheus-style metrics registry. Updated each tick; scraped by
     /// the metrics server task. Cloning is cheap (Arc).
     metrics: crate::metrics::MetricsRegistry,
+
+    /// Execution mode. `Paper` uses the synchronous in-memory
+    /// `PaperExecutor`; `Live` awaits the shared `LiveExecutor` and
+    /// reads per-market signing context from `live_contexts`.
+    mode: BotMode,
+    /// EIP-712 signing context per market — populated when a market
+    /// becomes active (token IDs + neg-risk flag + fee rate). Only
+    /// consulted in live mode.
+    live_contexts: HashMap<MarketId, crate::live::MarketContext>,
+}
+
+/// Selects which executor `evaluate_and_log` drives.
+#[derive(Clone)]
+pub enum BotMode {
+    /// Synchronous paper fills at the observed mid. No network.
+    Paper,
+    /// Real signed orders against the Polymarket CLOB. Shared with the
+    /// reconciliation task — wrap in `Arc<AsyncMutex>` to allow both
+    /// the main loop and the recon task to call into it.
+    Live(Arc<AsyncMutex<crate::live::LiveExecutor>>),
 }
 
 impl BotState {
@@ -403,7 +509,16 @@ impl BotState {
             // 600s = 10 min rolling distribution of YES spreads.
             yes_spread_stats: crate::stats::RollingStats::with_min_samples(600.0, 20),
             metrics,
+            mode: BotMode::Paper,
+            live_contexts: HashMap::new(),
         }
+    }
+
+    /// Swap the executor into live mode. After this returns, every
+    /// strategy fire routes through the shared `LiveExecutor` instead
+    /// of the in-memory paper executor.
+    fn set_live_mode(&mut self, live: Arc<AsyncMutex<crate::live::LiveExecutor>>) {
+        self.mode = BotMode::Live(live);
     }
 
     /// Sync all gauge values into the metrics registry. Counters are
@@ -695,6 +810,18 @@ impl BotState {
             end_epoch = market.end_time_epoch,
             "switching active market"
         );
+        // Cache the live-signing context for this market. BTC up/down 5m
+        // markets are standard (not neg-risk) and have historically had
+        // zero on-chain fee — both are hardcoded for v1. A future
+        // commit will fetch `/neg-risk` and `/fee-rate-bps` per market.
+        let ctx = crate::live::MarketContext {
+            yes_token_id: market.yes_token.as_str().to_string(),
+            no_token_id: market.no_token.as_str().to_string(),
+            neg_risk: false,
+            fee_rate_bps: 0,
+            chain_id: 137,
+        };
+        self.live_contexts.insert(market.id.clone(), ctx);
         let new_active = ActiveMarket::new(market, &self.btc_history);
         if let Some(strike) = new_active.strike {
             info!(
@@ -717,7 +844,12 @@ impl BotState {
     }
 
     /// Compute FV, decide, evaluate risk, and emit one DecisionRecord.
-    fn evaluate_and_log(&mut self, now_s: f64) {
+    ///
+    /// Async because in live mode the fill path awaits the shared
+    /// `LiveExecutor` (which holds an HTTP client + mutex). Paper mode
+    /// stays synchronous internally — there's no `.await` on the paper
+    /// path, the `async` keyword is just for the type signature.
+    async fn evaluate_and_log(&mut self, now_s: f64) {
         let Some(am) = self.active.as_ref().cloned() else {
             return;
         };
@@ -896,31 +1028,109 @@ impl BotState {
                                     now_s,
                                 ) {
                                     RiskDecision::Approve(approved) => {
-                                        let fill = self
-                                            .executor
-                                            .submit(approved.clone(), &mut self.positions);
-                                        // Deduct cost from bankroll (we now hold shares, not cash).
-                                        self.bankroll_usd -= fill.fill_size_usd;
-                                        self.risk.record_fill(
-                                            approved.market_id.clone(),
-                                            fill.fill_size_usd,
-                                            now_s,
-                                        );
-                                        self.persist_snapshot();
-                                        info!(
-                                            event = "paper_fill",
-                                            market_id = %approved.market_id,
-                                            slug = %am.market.slug,
-                                            side = ?approved.side,
-                                            size_usd = format!("{:.4}", approved.size_usd),
-                                            price = format!("{:.4}", fill.fill_price),
-                                            edge = format!("{:.4}", approved.edge),
-                                            "paper fill"
-                                        );
-                                        Outcome3::Fired {
-                                            side: approved.side,
-                                            size_usd: fill.fill_size_usd,
-                                            price: fill.fill_price,
+                                        match &self.mode {
+                                            BotMode::Paper => {
+                                                let fill = self
+                                                    .executor
+                                                    .submit(approved.clone(), &mut self.positions);
+                                                // Deduct cost from bankroll (we now hold shares, not cash).
+                                                self.bankroll_usd -= fill.fill_size_usd;
+                                                self.risk.record_fill(
+                                                    approved.market_id.clone(),
+                                                    fill.fill_size_usd,
+                                                    now_s,
+                                                );
+                                                self.persist_snapshot();
+                                                info!(
+                                                    event = "paper_fill",
+                                                    market_id = %approved.market_id,
+                                                    slug = %am.market.slug,
+                                                    side = ?approved.side,
+                                                    size_usd = format!("{:.4}", approved.size_usd),
+                                                    price = format!("{:.4}", fill.fill_price),
+                                                    edge = format!("{:.4}", approved.edge),
+                                                    "paper fill"
+                                                );
+                                                Outcome3::Fired {
+                                                    side: approved.side,
+                                                    size_usd: fill.fill_size_usd,
+                                                    price: fill.fill_price,
+                                                }
+                                            }
+                                            BotMode::Live(live) => {
+                                                let live = live.clone();
+                                                let ctx = match self
+                                                    .live_contexts
+                                                    .get(&approved.market_id)
+                                                {
+                                                    Some(c) => c.clone(),
+                                                    None => {
+                                                        warn!(
+                                                            event = "live_fill_skipped",
+                                                            market_id = %approved.market_id,
+                                                            reason = "no_market_context",
+                                                            "missing live context for active market"
+                                                        );
+                                                        return;
+                                                    }
+                                                };
+                                                let mut guard = live.lock().await;
+                                                let submit_res =
+                                                    guard.submit(approved.clone(), &ctx).await;
+                                                drop(guard);
+                                                match submit_res {
+                                                    Ok(order_id) => {
+                                                        // Optimistic accounting: assume fill at the
+                                                        // signal price. The reconciliation loop will
+                                                        // correct if the venue cancels or
+                                                        // partial-fills (v1 limitation; see
+                                                        // `live.rs` module docs).
+                                                        self.positions.apply_fill(
+                                                            &approved.market_id,
+                                                            approved.side,
+                                                            approved.size_usd,
+                                                            approved.price,
+                                                        );
+                                                        self.bankroll_usd -= approved.size_usd;
+                                                        self.risk.record_fill(
+                                                            approved.market_id.clone(),
+                                                            approved.size_usd,
+                                                            now_s,
+                                                        );
+                                                        self.persist_snapshot();
+                                                        info!(
+                                                            event = "live_fill",
+                                                            market_id = %approved.market_id,
+                                                            slug = %am.market.slug,
+                                                            order_id = %order_id.as_str(),
+                                                            side = ?approved.side,
+                                                            size_usd = format!("{:.4}", approved.size_usd),
+                                                            price = format!("{:.4}", approved.price),
+                                                            edge = format!("{:.4}", approved.edge),
+                                                            "live fill submitted"
+                                                        );
+                                                        Outcome3::Fired {
+                                                            side: approved.side,
+                                                            size_usd: approved.size_usd,
+                                                            price: approved.price,
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            event = "live_submit_error",
+                                                            market_id = %approved.market_id,
+                                                            error = %e,
+                                                            "live submit failed; not booking fill"
+                                                        );
+                                                        Outcome3::Rejected {
+                                                            reason: format!("live_submit: {e}"),
+                                                            side: approved.side,
+                                                            intended_size_usd: approved.size_usd,
+                                                            intended_price: approved.price,
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     RiskDecision::Reject(reason) => Outcome3::Rejected {
