@@ -32,10 +32,14 @@ pub mod decision_log;
 pub mod execution;
 pub mod feeds;
 pub mod fv;
+pub mod live;
 pub mod market_state;
+pub mod metrics;
 pub mod position;
 pub mod risk;
 pub mod signals;
+pub mod state_persist;
+pub mod stats;
 pub mod strategy;
 
 // Re-export the demo entry so the `demo` binary can call it without

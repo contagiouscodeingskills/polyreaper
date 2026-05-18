@@ -54,16 +54,31 @@ pub struct Features {
     pub yes_book_imbalance: Option<f64>,
     pub no_book_imbalance: Option<f64>,
 
-    /// Normalised YES spread: `(yes_spread − baseline) / baseline`.
-    /// Wider-than-baseline = positive = penalty signal (less confident).
-    pub yes_spread_normalized: Option<f64>,
+    /// Z-score of current YES spread vs its rolling distribution.
+    /// Replaces the old `(spread − static_baseline) / static_baseline`
+    /// with a self-adapting baseline (rolling median + stdev). Positive
+    /// = wider than recent norm = less confidence.
+    pub yes_spread_z: Option<f64>,
 
     /// Lag feature for the YES side: an estimate of "by how much has
     /// Polymarket failed to catch up to recent BTC moves?". Positive →
     /// BTC moved up and Polymarket hasn't responded → YES under-priced.
-    /// Exact formula owned by the bot's feature extractor; the scoring
-    /// model treats it as a pre-normalised signed magnitude.
     pub lag_yes: Option<f64>,
+
+    /// Total Binance trade volume in BTC over the last 60s. Raw value;
+    /// scaled by its weight in `RegimeWeights`. Pair with
+    /// `binance_flow_imbalance_60s` to give "directional volume".
+    pub binance_volume_60s_btc: Option<f64>,
+
+    /// Binance signed trade flow imbalance over the last 60s.
+    /// `(buy_volume − sell_volume) / (buy_volume + sell_volume)`,
+    /// range `[-1, 1]`. Positive = aggressive buying.
+    pub binance_flow_imbalance_60s: Option<f64>,
+
+    /// Momentum: difference between short-window drift (30s) and
+    /// long-window drift (300s), both normalised by σ. Captures
+    /// "acceleration" — short-term direction relative to longer trend.
+    pub btc_momentum: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +140,11 @@ pub struct RegimeWeights {
     pub w_btc_drift_60s_z: f64,
     pub w_yes_book_imbalance: f64,
     pub w_no_book_imbalance: f64,
-    pub w_yes_spread_normalized: f64,
+    pub w_yes_spread_z: f64,
     pub w_lag_yes: f64,
+    pub w_binance_volume_60s_btc: f64,
+    pub w_binance_flow_imbalance_60s: f64,
+    pub w_btc_momentum: f64,
 }
 
 impl Default for RegimeWeights {
@@ -139,8 +157,11 @@ impl Default for RegimeWeights {
             w_btc_drift_60s_z: 0.0,
             w_yes_book_imbalance: 0.0,
             w_no_book_imbalance: 0.0,
-            w_yes_spread_normalized: 0.0,
+            w_yes_spread_z: 0.0,
             w_lag_yes: 0.0,
+            w_binance_volume_60s_btc: 0.0,
+            w_binance_flow_imbalance_60s: 0.0,
+            w_btc_momentum: 0.0,
         }
     }
 }
@@ -205,8 +226,11 @@ pub fn score(features: &Features, regime: Regime, cfg: &ScoringConfig) -> Option
         + w.w_btc_drift_60s_z * features.btc_drift_60s_z.unwrap_or(0.0)
         + w.w_yes_book_imbalance * features.yes_book_imbalance.unwrap_or(0.0)
         + w.w_no_book_imbalance * features.no_book_imbalance.unwrap_or(0.0)
-        + w.w_yes_spread_normalized * features.yes_spread_normalized.unwrap_or(0.0)
-        + w.w_lag_yes * features.lag_yes.unwrap_or(0.0);
+        + w.w_yes_spread_z * features.yes_spread_z.unwrap_or(0.0)
+        + w.w_lag_yes * features.lag_yes.unwrap_or(0.0)
+        + w.w_binance_volume_60s_btc * features.binance_volume_60s_btc.unwrap_or(0.0)
+        + w.w_binance_flow_imbalance_60s * features.binance_flow_imbalance_60s.unwrap_or(0.0)
+        + w.w_btc_momentum * features.btc_momentum.unwrap_or(0.0);
     let p_yes = norm_cdf(raw).clamp(0.0, 1.0);
     Some(ScoringOutcome {
         p_yes,
@@ -316,15 +340,33 @@ mod tests {
     #[test]
     fn negative_weight_inverts_contribution() {
         let mut cfg = ScoringConfig::default();
-        cfg.late.w_yes_spread_normalized = -1.0;
+        cfg.late.w_yes_spread_z = -1.0;
         let f = Features {
             btc_strike_distance_z: Some(0.0),
-            yes_spread_normalized: Some(1.0), // wider than baseline
+            yes_spread_z: Some(1.0), // wider than rolling baseline
             ..Default::default()
         };
         // raw = 0 + (-1)*1 = -1 → Φ(-1) ≈ 0.1587
         let out = score(&f, Regime::Late, &cfg).unwrap();
         assert!(out.p_yes < 0.25, "wide spread should push p_yes down");
+    }
+
+    #[test]
+    fn new_phase_1_features_contribute() {
+        let mut cfg = ScoringConfig::default();
+        cfg.mid.w_btc_momentum = 0.5;
+        cfg.mid.w_binance_flow_imbalance_60s = 0.5;
+        cfg.mid.w_binance_volume_60s_btc = 0.2;
+        let f = Features {
+            btc_strike_distance_z: Some(0.0),
+            btc_momentum: Some(1.0),
+            binance_flow_imbalance_60s: Some(0.5),
+            binance_volume_60s_btc: Some(2.0),
+            ..Default::default()
+        };
+        let out = score(&f, Regime::Mid, &cfg).expect("scored");
+        // raw = 0 + 0.5×1 + 0.5×0.5 + 0.2×2 = 0.5 + 0.25 + 0.4 = 1.15
+        assert!((out.raw - 1.15).abs() < 1e-9);
     }
 
     #[test]

@@ -77,6 +77,16 @@ impl PositionStore {
         self.open.len()
     }
 
+    /// Snapshot all open positions for persistence / audit.
+    pub fn open_positions(&self) -> Vec<Position> {
+        self.open.values().cloned().collect()
+    }
+
+    /// Borrow the per-market realised P&L map (for persistence / audit).
+    pub fn realised_pnl_map(&self) -> &HashMap<MarketId, f64> {
+        &self.realised_per_market
+    }
+
     pub fn get(&self, id: &MarketId) -> Option<&Position> {
         self.open.get(id)
     }
@@ -114,7 +124,10 @@ impl PositionStore {
                 // This branch should not fire in v0; included for safety.
                 let close_price = 1.0 - fill_price;
                 let realised = pos.close_at(close_price);
-                *self.realised_per_market.entry(market_id.clone()).or_default() += realised;
+                *self
+                    .realised_per_market
+                    .entry(market_id.clone())
+                    .or_default() += realised;
                 self.open.remove(market_id);
                 self.open.insert(
                     market_id.clone(),
@@ -147,20 +160,29 @@ impl PositionStore {
     pub fn close_market(&mut self, market_id: &MarketId, exit_price: f64) -> Option<f64> {
         let mut pos = self.open.remove(market_id)?;
         let pnl = pos.close_at(exit_price);
-        *self.realised_per_market.entry(market_id.clone()).or_default() += pnl;
+        *self
+            .realised_per_market
+            .entry(market_id.clone())
+            .or_default() += pnl;
         Some(pnl)
     }
 
     pub fn settle_resolution(&mut self, market_id: &MarketId, winner: Outcome) -> Option<f64> {
         let mut pos = self.open.remove(market_id)?;
         let pnl = pos.settle_at_resolution(winner);
-        *self.realised_per_market.entry(market_id.clone()).or_default() += pnl;
+        *self
+            .realised_per_market
+            .entry(market_id.clone())
+            .or_default() += pnl;
         Some(pnl)
     }
 
     /// Unrealised across all open positions, given a function that maps a
     /// market → current price of the side that market's position holds.
-    pub fn total_unrealised(&self, mut price_lookup: impl FnMut(&MarketId, Outcome) -> Option<f64>) -> f64 {
+    pub fn total_unrealised(
+        &self,
+        mut price_lookup: impl FnMut(&MarketId, Outcome) -> Option<f64>,
+    ) -> f64 {
         let mut total = 0.0;
         for (id, pos) in &self.open {
             if let Some(mid) = price_lookup(id, pos.side) {

@@ -10,6 +10,32 @@ pub struct BotConfig {
     pub risk: RiskConfig,
     pub feeds: FeedsConfig,
     pub scoring: crate::signals::scoring::ScoringConfig,
+    pub metrics: MetricsConfig,
+}
+
+/// Prometheus-style metrics endpoint. Empty `listen_addr` disables the
+/// server entirely. Default exposes on localhost:9898 — Prometheus
+/// scraper can be pointed at it.
+///
+/// ## Security
+///
+/// The endpoint is unauthenticated. The default bind (`127.0.0.1:9898`)
+/// is loopback-only — safe for a Prometheus scraper running on the same
+/// host. **Do not** bind to `0.0.0.0` or a public IP without putting an
+/// auth proxy in front: bankroll, P&L, decision counts, market IDs, and
+/// strike values are all exposed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    pub listen_addr: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "127.0.0.1:9898".to_string(),
+        }
+    }
 }
 
 /// Endpoints + polling cadences for the read-side feeds the bot consumes.
@@ -26,8 +52,10 @@ pub struct FeedsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BinanceFeedSettings {
-    /// Single-stream WS endpoint. `/ws/<stream>` doesn't need a SUBSCRIBE.
+    /// Single-stream WS endpoint for bookTicker (BTC mid).
     pub ws_url: String,
+    /// Single-stream WS endpoint for trades (volume + flow).
+    pub trade_ws_url: String,
     /// Reconnect if no inbound text frame for this many seconds.
     pub read_idle_secs: u64,
 }
@@ -76,6 +104,12 @@ pub struct StrategyConfig {
     /// slightly conservative default.
     pub fallback_sigma_per_sec: f64,
 
+    /// Bankroll-fraction sizing: `size_usd = bankroll × edge × bankroll_pct_per_edge`.
+    /// Probability units in, fraction out. Default `0.02` → 0.1% of
+    /// bankroll at 5% edge, 0.2% at 10% edge (user's spec May 2026).
+    /// `max_per_trade_usd` still applies as a hard ceiling.
+    pub bankroll_pct_per_edge: f64,
+
     /// Polymarket crypto-market taker fee rate. Fee as fraction of
     /// notional is `taker_fee_rate × p × (1 − p)`, where `p` is the
     /// share price. Default 0.072 → peak 1.80% at `p = 0.5`, dropping
@@ -96,12 +130,32 @@ pub struct StrategyConfig {
     /// feature: `(observed_spread - baseline) / baseline`. Default 0.01
     /// (1¢, the typical Polymarket tick).
     pub spread_baseline: f64,
+
+    /// Refuse to fire if the latest Binance bookTicker frame is older
+    /// than this many seconds. Guards against stale-BTC trades on a
+    /// disconnected feed.
+    pub max_btc_tick_age_secs: f64,
+    /// Refuse to fire if the latest Polymarket book snapshot is older
+    /// than this many seconds. Guards against trading off a stale book.
+    pub max_poly_book_age_secs: f64,
+    /// Minimum plausible σ per second. Estimates below this snap to
+    /// the fallback (used to detect "flat-price" regimes where σ→0
+    /// would otherwise cause degenerate FV).
+    pub min_sigma_per_sec: f64,
+    /// Maximum plausible σ per second. Estimates above this trigger
+    /// `IncompleteReason::SigmaOutOfRange` — refuse to fire, since
+    /// the vol estimator is probably picking up a venue glitch.
+    pub max_sigma_per_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RiskConfig {
-    /// Max USD size per single trade.
+    /// Initial USDC bankroll for paper-mode simulation. Live mode
+    /// would query the actual proxy-wallet balance instead. Drives
+    /// edge-scaled sizing via `StrategyConfig::bankroll_pct_per_edge`.
+    pub bankroll_initial_usd: f64,
+    /// Max USD size per single trade — hard ceiling on bankroll-fraction sizing.
     pub max_per_trade_usd: f64,
     /// Max cumulative USD cost basis on a single market. Caps total
     /// exposure even when many small fills would otherwise stack up.
@@ -111,6 +165,12 @@ pub struct RiskConfig {
     /// kill switch trips for that market — no new orders, flatten if
     /// possible.
     pub max_loss_per_market_usd: f64,
+    /// Portfolio-level kill switch. If aggregate session loss (realised
+    /// + unrealised on the active market) reaches this, the engine
+    /// halts ALL new trading across every market. Sticky once tripped
+    /// — only an operator-driven `reset_kill_switch()` clears it. Set
+    /// to a non-positive value or NaN to disable.
+    pub max_session_loss_usd: f64,
     /// Minimum seconds between consecutive fills on the same market.
     /// Defends against firing every tick when Polymarket hasn't yet
     /// repriced; without this a sticky edge could spam orders.
@@ -127,6 +187,7 @@ impl Default for BotConfig {
             risk: RiskConfig::default(),
             feeds: FeedsConfig::default(),
             scoring: crate::signals::scoring::ScoringConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -145,6 +206,7 @@ impl Default for BinanceFeedSettings {
     fn default() -> Self {
         Self {
             ws_url: "wss://stream.binance.com:9443/ws/btcusdt@bookTicker".to_string(),
+            trade_ws_url: "wss://stream.binance.com:9443/ws/btcusdt@trade".to_string(),
             read_idle_secs: 30,
         }
     }
@@ -176,10 +238,15 @@ impl Default for StrategyConfig {
             min_ttr_secs: 15.0,
             vol_window_secs: 60.0,
             fallback_sigma_per_sec: 5.0e-5,
+            bankroll_pct_per_edge: 0.02,
             taker_fee_rate: 0.072,
             taker_safety_margin: 0.005,
             fv_tick_ms: 100,
             spread_baseline: 0.01,
+            max_btc_tick_age_secs: 5.0,
+            max_poly_book_age_secs: 3.0,
+            min_sigma_per_sec: 1.0e-7,
+            max_sigma_per_sec: 1.0e-2,
         }
     }
 }
@@ -187,9 +254,13 @@ impl Default for StrategyConfig {
 impl Default for RiskConfig {
     fn default() -> Self {
         Self {
-            max_per_trade_usd: 1.0,
-            max_notional_per_market_usd: 5.0,
-            max_loss_per_market_usd: 5.0,
+            bankroll_initial_usd: 1000.0,
+            max_per_trade_usd: 5.0,
+            max_notional_per_market_usd: 25.0,
+            max_loss_per_market_usd: 25.0,
+            // Default 3% of starting bankroll. Generous in normal play,
+            // tight enough to catch a sustained losing streak.
+            max_session_loss_usd: 30.0,
             min_secs_between_fires_per_market: 2.0,
             max_concurrent_positions: 1,
         }
@@ -213,7 +284,10 @@ mod tests {
         let parsed = BotConfig::from_toml_str(&serialised).unwrap();
         assert_eq!(parsed.mode, original.mode);
         assert_eq!(parsed.strategy.edge_scale, original.strategy.edge_scale);
-        assert_eq!(parsed.strategy.taker_fee_rate, original.strategy.taker_fee_rate);
+        assert_eq!(
+            parsed.strategy.taker_fee_rate,
+            original.strategy.taker_fee_rate
+        );
         assert_eq!(
             parsed.risk.max_per_trade_usd,
             original.risk.max_per_trade_usd

@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use bot::bot::run_paper;
 use bot::config::BotConfig;
+use bot::live::{LiveCredentials, LiveExecError, LiveExecutor};
 
 #[tokio::main]
 async fn main() {
@@ -20,10 +21,36 @@ async fn main() {
 
     let cfg = load_config();
 
-    if cfg.mode != bot::config::Mode::Paper {
-        warn!(
-            "live mode is not yet wired (no wallet/signing). Forcing paper mode for this run."
-        );
+    // Live mode is gated behind credentials being present. We fail
+    // loudly here rather than silently falling back to paper — a
+    // misconfigured live deployment that quietly runs paper is the
+    // worst possible failure mode (the user thinks they're trading
+    // and isn't).
+    if cfg.mode == bot::config::Mode::Live {
+        match LiveExecutor::new(LiveCredentials::from_env()) {
+            Ok(_exec) => {
+                // Once the live executor's `submit` is implemented, the
+                // bot orchestrator should be invoked with it here.
+                warn!(
+                    "Mode::Live: credentials present but live executor is not yet \
+                     implemented (Phase 7 scaffold only). Refusing to start. Set \
+                     mode = \"paper\" or finish wiring `LiveExecutor::submit`."
+                );
+                std::process::exit(2);
+            }
+            Err(LiveExecError::CredentialsMissing) => {
+                warn!(
+                    "Mode::Live but POLYMARKET_EOA_PRIVATE_KEY / \
+                     POLYMARKET_PROXY_WALLET_ADDRESS are not set. Refusing to \
+                     start (silent paper fallback would be unsafe)."
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                warn!(error = %e, "live executor failed to initialise");
+                std::process::exit(2);
+            }
+        }
     }
 
     info!(

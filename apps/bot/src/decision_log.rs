@@ -11,7 +11,19 @@
 //! Records are flushed per-write — the rate is low (≈2/s) and
 //! crash-safety matters more than throughput for paper-mode audit data.
 //!
-//! Schema is `schema_version = 1`; bump on breaking changes.
+//! Schema is `schema_version = 4`; bump on breaking changes.
+//!
+//! ## Schema history
+//! - v1: initial.
+//! - v2: MVP C — settlement + resolution columns.
+//! - v3: multi-factor scoring fields + per-feature columns.
+//! - v4: rename `feat_yes_spread_normalized` → `feat_yes_spread_z`
+//!   (adaptive z-score replaces static-baseline ratio); add
+//!   `feat_btc_momentum`, `feat_binance_volume_60s_btc`,
+//!   `feat_binance_flow_imbalance_60s`; add DQ-gate incomplete
+//!   reasons (`StaleBinanceFeed`, `StalePolyBook`, `SigmaOutOfRange`);
+//!   add `kill_switch_tripped` reject reason. v3 readers MUST be
+//!   updated — `feat_yes_spread_normalized` is GONE.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -23,7 +35,7 @@ use crate::config::BotConfig;
 use crate::risk::RejectReason;
 use crate::strategy::NoSignalReason;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Record
@@ -103,7 +115,10 @@ pub struct DecisionRecord {
     pub feat_btc_drift_60s_z: Option<f64>,
     pub feat_yes_book_imbalance: Option<f64>,
     pub feat_no_book_imbalance: Option<f64>,
-    pub feat_yes_spread_normalized: Option<f64>,
+    pub feat_yes_spread_z: Option<f64>,
+    pub feat_btc_momentum: Option<f64>,
+    pub feat_binance_volume_60s_btc: Option<f64>,
+    pub feat_binance_flow_imbalance_60s: Option<f64>,
 
     // Fee-aware taker gate diagnostics. Required edge to break even at
     // each side's ask, given the Polymarket fee curve + safety margin.
@@ -156,6 +171,14 @@ pub enum IncompleteReason {
     NoBtcMid,
     NoPolyYesMid,
     TtrNonPositive,
+    /// Binance tick is older than `max_btc_tick_age_secs`. Refusing to
+    /// fire on stale BTC.
+    StaleBinanceFeed,
+    /// Polymarket book snapshot is older than `max_poly_book_age_secs`.
+    StalePolyBook,
+    /// σ estimate is outside the sanity envelope (suggests vol-estimator
+    /// is broken — refuse to derive FV from it).
+    SigmaOutOfRange,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,10 +197,7 @@ impl DecisionLogger {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             writer: BufWriter::new(file),
             path,
@@ -230,7 +250,11 @@ pub fn epoch_secs_to_compact_iso(secs: i64) -> String {
     let mi = ((sod % 3_600) / 60) as u32;
     let sc = (sod % 60) as u32;
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
@@ -239,10 +263,7 @@ pub fn epoch_secs_to_compact_iso(secs: i64) -> String {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        y, m, d, h, mi, sc
-    )
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, h, mi, sc)
 }
 
 pub fn write_session_meta(path: &Path, meta: &SessionMeta) -> std::io::Result<()> {
@@ -366,7 +387,10 @@ mod tests {
             feat_btc_drift_60s_z: None,
             feat_yes_book_imbalance: None,
             feat_no_book_imbalance: None,
-            feat_yes_spread_normalized: None,
+            feat_yes_spread_z: None,
+            feat_btc_momentum: None,
+            feat_binance_volume_60s_btc: None,
+            feat_binance_flow_imbalance_60s: None,
             taker_required_edge_yes: None,
             taker_required_edge_no: None,
             implied_strike_usd: None,
@@ -447,6 +471,7 @@ pub fn reject_reason_to_str(r: &RejectReason) -> &'static str {
         RejectReason::TooManyConcurrent => "too_many_concurrent",
         RejectReason::Cooldown => "cooldown",
         RejectReason::NotionalCapReached => "notional_cap_reached",
+        RejectReason::KillSwitchTripped => "kill_switch_tripped",
         RejectReason::InternalError => "internal_error",
     }
 }
@@ -492,10 +517,7 @@ impl ResolutionLogger {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             writer: BufWriter::new(file),
             path,

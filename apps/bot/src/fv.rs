@@ -35,7 +35,8 @@ pub fn norm_cdf(x: f64) -> f64 {
 
     let k = 1.0 / (1.0 + P * xa);
     let phi = (1.0 / (2.0 * std::f64::consts::PI).sqrt()) * (-0.5 * xa * xa).exp();
-    let approx = 1.0 - phi * (A1 * k + A2 * k.powi(2) + A3 * k.powi(3) + A4 * k.powi(4) + A5 * k.powi(5));
+    let approx =
+        1.0 - phi * (A1 * k + A2 * k.powi(2) + A3 * k.powi(3) + A4 * k.powi(4) + A5 * k.powi(5));
 
     // approx is Φ(xa) for xa ≥ 0. Reflect for negative inputs.
     if sign < 0.0 {
@@ -59,7 +60,10 @@ pub struct FairValue {
 impl FairValue {
     pub fn from_p_yes(p: f64) -> Self {
         let p = p.clamp(0.0, 1.0);
-        Self { p_yes: p, p_no: 1.0 - p }
+        Self {
+            p_yes: p,
+            p_no: 1.0 - p,
+        }
     }
 }
 
@@ -131,15 +135,29 @@ pub fn implied_strike(
 /// - `strike`: BTC mid at market open, USD.
 /// - `secs_to_resolution`: T, seconds. Must be > 0.
 /// - `sigma_per_sec`: σ on log-returns, per second. Must be > 0.
-pub fn compute_fv(btc_now: f64, strike: f64, secs_to_resolution: f64, sigma_per_sec: f64) -> FairValue {
-    if !(btc_now.is_finite() && strike.is_finite() && secs_to_resolution.is_finite() && sigma_per_sec.is_finite())
+pub fn compute_fv(
+    btc_now: f64,
+    strike: f64,
+    secs_to_resolution: f64,
+    sigma_per_sec: f64,
+) -> FairValue {
+    if !(btc_now.is_finite()
+        && strike.is_finite()
+        && secs_to_resolution.is_finite()
+        && sigma_per_sec.is_finite())
         || btc_now <= 0.0
         || strike <= 0.0
         || secs_to_resolution <= 0.0
         || sigma_per_sec <= 0.0
     {
         // Degenerate input: snap to current price comparison.
-        let p = if btc_now > strike { 1.0 } else if btc_now < strike { 0.0 } else { 0.5 };
+        let p = if btc_now > strike {
+            1.0
+        } else if btc_now < strike {
+            0.0
+        } else {
+            0.5
+        };
         return FairValue::from_p_yes(p);
     }
     let sigma_t = sigma_per_sec * secs_to_resolution.sqrt();

@@ -325,7 +325,7 @@ mod tests {
         let mut h = BtcHistory::new(30.0);
         h.observe(0.0, 100.0);
         h.observe(60.0, 102.0); // prunes the t=0 sample (cutoff = 30)
-        // window of 60s ago — not in buffer.
+                                // window of 60s ago — not in buffer.
         assert!(h.log_return_over(60.0).is_none());
     }
 }

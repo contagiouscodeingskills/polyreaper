@@ -102,7 +102,10 @@ pub async fn run_market_discovery(
                         }
                     }
                 } else {
-                    debug!(component = "polymarket_disc", "no tradeable BTC 5m market right now");
+                    debug!(
+                        component = "polymarket_disc",
+                        "no tradeable BTC 5m market right now"
+                    );
                     let _ = active_market_tx.send(None);
                 }
             }
@@ -139,10 +142,7 @@ async fn fetch_active_markets(
     if !status.is_success() {
         return Err(format!("gamma HTTP {status}"));
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("gamma body: {e}"))?;
+    let body = resp.text().await.map_err(|e| format!("gamma body: {e}"))?;
     adapter
         .map_response(&body)
         .map_err(|e| format!("gamma parse: {e}"))
@@ -257,7 +257,10 @@ pub async fn run_book_poller(
         };
 
         if yes_bid.is_none() && no_bid.is_none() {
-            debug!(component = "polymarket_book", "no usable book on either side");
+            debug!(
+                component = "polymarket_book",
+                "no usable book on either side"
+            );
             continue;
         }
 
@@ -510,8 +513,8 @@ mod tests {
     fn pick_active_returns_none_when_all_in_future_or_past() {
         let now = 1000;
         let markets = vec![
-            mk_market("A", None, now - 300),      // closed (end in the past)
-            mk_market("B", None, now + 360),      // future (end > now + 300)
+            mk_market("A", None, now - 300),       // closed (end in the past)
+            mk_market("B", None, now + 360),       // future (end > now + 300)
             mk_market("C", None, now + 1_000_000), // far future
         ];
         assert!(pick_active_market(&markets, now).is_none());
@@ -546,9 +549,11 @@ mod tests {
         // a start_date 24h in the past for what's actually a future market.
         // The picker must not be fooled.
         let now = 1000;
-        let markets = vec![
-            mk_market("far-future-with-stale-start", Some(now - 86400), now + 1000),
-        ];
+        let markets = vec![mk_market(
+            "far-future-with-stale-start",
+            Some(now - 86400),
+            now + 1000,
+        )];
         assert!(pick_active_market(&markets, now).is_none());
     }
 

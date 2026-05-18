@@ -48,7 +48,11 @@ pub struct DecisionInputs<'a> {
     pub poly_no_bid: Option<f64>,
     pub poly_no_ask: Option<f64>,
     pub ttr_secs: f64,
+    /// Hard ceiling on a single trade's size.
     pub max_per_trade_usd: f64,
+    /// Current bankroll for edge-scaled sizing. Live trades scale to
+    /// `bankroll × edge × StrategyConfig::bankroll_pct_per_edge`.
+    pub bankroll_usd: f64,
 }
 
 /// Outcome of one strategy tick.
@@ -137,10 +141,14 @@ pub fn decide(inputs: DecisionInputs<'_>, cfg: &StrategyConfig) -> StrategyOutco
         return StrategyOutcome::NoSignal(NoSignalReason::EdgeBelowGate);
     }
 
-    // Size by how much we beat the gate.
-    let excess = best.edge_after_ask - required;
-    let scale = (excess / cfg.edge_scale).clamp(0.0, 1.0);
-    let size_usd = inputs.max_per_trade_usd * scale;
+    // Bankroll-fraction sizing:
+    //   size = bankroll × edge × bankroll_pct_per_edge
+    // Capped by max_per_trade. Uses the FULL edge (not excess over gate)
+    // so sizing scales smoothly with conviction. Below the gate we don't
+    // fire at all (above check); above the gate, size scales with edge.
+    let raw_size_usd =
+        inputs.bankroll_usd.max(0.0) * best.edge_after_ask * cfg.bankroll_pct_per_edge.max(0.0);
+    let size_usd = raw_size_usd.min(inputs.max_per_trade_usd).max(0.0);
     if size_usd <= 0.0 {
         return StrategyOutcome::NoSignal(NoSignalReason::SizeNonPositive);
     }
@@ -204,6 +212,7 @@ mod tests {
             poly_no_ask: Some(no_ask),
             ttr_secs: 120.0,
             max_per_trade_usd: 1.0,
+            bankroll_usd: 1000.0,
         }
     }
 
@@ -275,7 +284,10 @@ mod tests {
         let c = cfg();
         let expected = |p: f64| c.taker_fee_rate * p * p * (1.0 - p) + c.taker_safety_margin;
         for p in [0.10, 0.30, 0.50, 0.67, 0.90] {
-            assert!((taker_required_edge(p, &c) - expected(p)).abs() < 1e-12, "p={p}");
+            assert!(
+                (taker_required_edge(p, &c) - expected(p)).abs() < 1e-12,
+                "p={p}"
+            );
         }
     }
 
@@ -308,8 +320,56 @@ mod tests {
             poly_no_ask: None,
             ttr_secs: 120.0,
             max_per_trade_usd: 1.0,
+            bankroll_usd: 1000.0,
         };
         assert_eq!(expect_no(decide(i, &cfg())), NoSignalReason::PolyAskMissing);
+    }
+
+    #[test]
+    fn bankroll_sizing_matches_user_spec() {
+        // User spec: 5% edge → 0.1% of bankroll, 10% edge → 0.2%.
+        // Formula: size = bankroll × edge × bankroll_pct_per_edge.
+        // With defaults (bankroll=$1000, pct=0.02):
+        //   edge=0.05 → 0.05 × 0.02 = 0.001 of bankroll = $1
+        //   edge=0.10 → 0.10 × 0.02 = 0.002 of bankroll = $2
+        let m = MarketId::new("M");
+        let c = cfg();
+        // Construct a 0.10 edge YES: scoring p_yes = 0.50, yes_ask = 0.40
+        // (edge_after_ask = 0.10; required at 0.40 ≈ 0.011; passes gate).
+        let mut i = inputs(&m, 0.50, 0.40, 0.99);
+        i.bankroll_usd = 1000.0;
+        i.max_per_trade_usd = 10.0; // raise so bankroll math isn't capped
+        let sig = expect_fire(decide(i, &c));
+        // size = 1000 × 0.10 × 0.02 = $2.00
+        assert!((sig.size_usd - 2.0).abs() < 1e-6, "got {}", sig.size_usd);
+    }
+
+    #[test]
+    fn bankroll_sizing_capped_by_max_per_trade() {
+        let m = MarketId::new("M");
+        let c = cfg();
+        let mut i = inputs(&m, 0.20, 0.99, 0.20); // huge NO edge ~0.60
+        i.bankroll_usd = 100_000.0;
+        i.max_per_trade_usd = 5.0;
+        let sig = expect_fire(decide(i, &c));
+        // Without cap: 100k × 0.60 × 0.02 = $1200; capped at $5
+        assert!((sig.size_usd - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bankroll_sizing_scales_linearly_with_bankroll() {
+        let m = MarketId::new("M");
+        let c = cfg();
+        let mut i_small = inputs(&m, 0.50, 0.40, 0.99);
+        i_small.bankroll_usd = 500.0;
+        i_small.max_per_trade_usd = 50.0;
+        let s_small = expect_fire(decide(i_small.clone(), &c));
+        let mut i_big = inputs(&m, 0.50, 0.40, 0.99);
+        i_big.bankroll_usd = 2000.0;
+        i_big.max_per_trade_usd = 50.0;
+        let s_big = expect_fire(decide(i_big, &c));
+        // 4× the bankroll → 4× the size (until cap).
+        assert!((s_big.size_usd / s_small.size_usd - 4.0).abs() < 1e-6);
     }
 
     #[test]
@@ -324,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn size_scales_with_edge_over_gate() {
+    fn size_scales_with_edge() {
         let m = MarketId::new("M");
         let c = cfg();
         // Small edge above gate → small size.

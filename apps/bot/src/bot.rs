@@ -17,9 +17,9 @@ use tracing::{info, warn};
 
 use crate::config::BotConfig;
 use crate::decision_log::{
-    make_session_id, reject_reason_to_str, time_bucket_for, write_session_meta, BOT_VERSION,
-    DecisionKind, DecisionLogger, DecisionRecord, IncompleteReason, ResolutionLogger,
-    ResolutionRecord, SessionMeta, SCHEMA_VERSION,
+    make_session_id, reject_reason_to_str, time_bucket_for, write_session_meta, DecisionKind,
+    DecisionLogger, DecisionRecord, IncompleteReason, ResolutionLogger, ResolutionRecord,
+    SessionMeta, BOT_VERSION, SCHEMA_VERSION,
 };
 use crate::execution::PaperExecutor;
 use crate::feeds;
@@ -43,6 +43,14 @@ pub enum BotEvent {
         /// Local receive timestamp, ns since epoch.
         t_ns: u128,
         mid_usd: f64,
+    },
+    /// A Binance executed trade — drives volume + flow features.
+    BinanceTrade {
+        t_ns: u128,
+        price_usd: f64,
+        qty: f64,
+        /// True when the buyer was the taker (aggressive buy, hit ask).
+        buyer_is_taker: bool,
     },
     /// A Polymarket CLOB book snapshot for the currently-active market.
     /// Carries full TOB for both YES and NO sides so the bot can log
@@ -164,6 +172,13 @@ pub async fn run_paper(cfg: BotConfig) {
         feeds::polymarket::run_book_poller(poly_cfg, book_active, book_tx).await;
     });
 
+    // Binance: trade feed — drives volume + flow features.
+    let trade_cfg = cfg.feeds.binance.clone();
+    let trade_tx = events_tx.clone();
+    tokio::spawn(async move {
+        feeds::binance::run_trades(trade_cfg, trade_tx).await;
+    });
+
     // Polymarket: resolution sweeper (Gamma ?closed=true poll).
     let resolution_gamma_cfg = cfg.feeds.gamma.clone();
     let resolution_tx = events_tx.clone();
@@ -176,11 +191,63 @@ pub async fn run_paper(cfg: BotConfig) {
 
     drop(events_tx);
 
+    // State persistence — restore bankroll from stable path if a prior
+    // run wrote one. Position state is NOT restored (paper v1 — see
+    // module docs on `state_persist`); live mode will reconcile via
+    // Phase 7 CLOB queries instead.
+    let state_path = PathBuf::from("data").join("bot_state.ndjson");
+    let restored_bankroll = match crate::state_persist::load_latest(&state_path) {
+        Ok(Some(snap)) => {
+            info!(
+                event = "state_restored",
+                bankroll_usd = snap.bankroll_usd,
+                saved_at_ns = %snap.saved_at_local_ts_ns,
+                prior_session = %snap.session_id,
+                "restoring bankroll from previous session"
+            );
+            Some(snap.bankroll_usd)
+        }
+        Ok(None) => {
+            info!("no prior state snapshot — starting fresh");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, path = %state_path.display(), "failed to load state; starting fresh");
+            None
+        }
+    };
+    let initial_bankroll = restored_bankroll.unwrap_or(cfg.risk.bankroll_initial_usd);
+    let state_persister = match crate::state_persist::StatePersister::open(state_path.clone()) {
+        Ok(sp) => Some(sp),
+        Err(e) => {
+            warn!(error = %e, path = %state_path.display(), "failed to open state persister; continuing without persistence");
+            None
+        }
+    };
+
+    // Metrics: registry is shared between bot + server. Server runs as
+    // an independent task so a slow scrape can never block the FV loop.
+    let metrics = crate::metrics::MetricsRegistry::new();
+    let metrics_addr = cfg.metrics.listen_addr.clone();
+    if !metrics_addr.is_empty() {
+        let metrics_for_server = metrics.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics::run_server(&metrics_addr, metrics_for_server).await {
+                warn!(error = %e, "metrics server task ended");
+            }
+        });
+    } else {
+        info!("metrics listen_addr is empty; metrics server disabled");
+    }
+
     let mut state = BotState::new(
         cfg.clone(),
         paths.session_id.clone(),
         logger,
         resolution_logger,
+        state_persister,
+        initial_bankroll,
+        metrics,
     );
 
     let mut status_ticker = tokio::time::interval(Duration::from_secs(30));
@@ -264,6 +331,12 @@ struct BotState {
     executor: PaperExecutor,
     active: Option<ActiveMarket>,
 
+    /// Tracked USDC bankroll. Initialised from `RiskConfig::bankroll_initial_usd`;
+    /// mutated on every resolution (paper) by `settled_pnl_usd` and on
+    /// every fill by the fill's cost basis (since we hold non-cash
+    /// shares between fill and settle).
+    bankroll_usd: f64,
+
     /// Markets the bot has evaluated at least once (i.e. had as `active`
     /// long enough to write a decision). Used to filter resolution-sweep
     /// events down to "ours" — we don't log resolutions for the ~12 BTC
@@ -276,6 +349,23 @@ struct BotState {
     /// Local-clock ns of the most recent BtcTick — for the freshness flag
     /// in the decision log.
     last_btc_tick_ns: Option<u128>,
+
+    /// Optional persister writes a state snapshot on every mutation
+    /// (fill / settle). Reloaded on next boot for bankroll continuity.
+    state_persister: Option<crate::state_persist::StatePersister>,
+
+    /// Rolling 60s window of Binance trade qty (BTC). Sum = volume.
+    binance_volume_60s_stats: crate::stats::RollingStats,
+    /// Rolling 60s window of signed Binance trade qty (positive when
+    /// buyer is taker). Sum = signed flow imbalance.
+    binance_flow_60s_stats: crate::stats::RollingStats,
+    /// Cross-market rolling distribution of observed YES spreads.
+    /// Powers the adaptive `yes_spread_z` feature.
+    yes_spread_stats: crate::stats::RollingStats,
+
+    /// Prometheus-style metrics registry. Updated each tick; scraped by
+    /// the metrics server task. Cloning is cheap (Arc).
+    metrics: crate::metrics::MetricsRegistry,
 }
 
 impl BotState {
@@ -284,8 +374,12 @@ impl BotState {
         session_id: String,
         logger: Option<DecisionLogger>,
         resolution_logger: Option<ResolutionLogger>,
+        state_persister: Option<crate::state_persist::StatePersister>,
+        initial_bankroll: f64,
+        metrics: crate::metrics::MetricsRegistry,
     ) -> Self {
         let vol_window = cfg.strategy.vol_window_secs;
+        let _ = &cfg.risk.bankroll_initial_usd; // documented: initial_bankroll wins
         Self {
             cfg,
             session_id,
@@ -299,15 +393,64 @@ impl BotState {
             risk: RiskEngine::new(),
             executor: PaperExecutor::new(),
             active: None,
+            bankroll_usd: initial_bankroll,
             seen_markets: HashSet::new(),
             resolved_markets: HashSet::new(),
             last_btc_tick_ns: None,
+            state_persister,
+            binance_volume_60s_stats: crate::stats::RollingStats::with_min_samples(60.0, 1),
+            binance_flow_60s_stats: crate::stats::RollingStats::with_min_samples(60.0, 1),
+            // 600s = 10 min rolling distribution of YES spreads.
+            yes_spread_stats: crate::stats::RollingStats::with_min_samples(600.0, 20),
+            metrics,
         }
+    }
+
+    /// Sync all gauge values into the metrics registry. Counters are
+    /// updated incrementally elsewhere (see `MetricsRegistry::record_decision`).
+    /// Called at the bottom of each FV tick + once on each status emit.
+    fn refresh_metrics(&self) {
+        let realised_pnl_map = self
+            .positions
+            .realised_pnl_map()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), *v))
+            .collect();
+        let latest_btc = self.btc_history.latest().map(|(_, m)| m);
+        let sigma = self.vol.primary.sigma_per_sec();
+        let (strike, ttr) = match &self.active {
+            Some(am) => (am.strike, Some(am.ttr_secs(now_epoch_secs_f64()))),
+            None => (None, None),
+        };
+        self.metrics.update_with(|s| {
+            s.bankroll_usd = self.bankroll_usd;
+            s.total_realised_pnl_usd = self.positions.total_realised();
+            s.open_positions = self.positions.open_count();
+            s.total_fills = self.executor.fill_count() as u64;
+            s.seen_markets = self.seen_markets.len();
+            s.resolved_markets = self.resolved_markets.len();
+            s.btc_history_len = self.btc_history.len();
+            s.vol_samples = self.vol.primary.len();
+            s.kill_switch_tripped = self.risk.is_kill_switch_tripped();
+            s.latest_btc_mid_usd = latest_btc;
+            s.sigma_per_sec = sigma;
+            s.latest_strike_usd = strike;
+            s.latest_ttr_secs = ttr;
+            s.realised_pnl_per_market_usd = realised_pnl_map;
+            // decisions_*_total are written by record_decision elsewhere
+            // and intentionally preserved across this refresh.
+        });
     }
 
     fn handle_event(&mut self, ev: BotEvent) {
         match ev {
             BotEvent::BtcTick { t_ns, mid_usd } => self.on_btc_tick(t_ns, mid_usd),
+            BotEvent::BinanceTrade {
+                t_ns: _,
+                price_usd: _,
+                qty,
+                buyer_is_taker,
+            } => self.on_binance_trade(qty, buyer_is_taker),
             BotEvent::PolyBook {
                 t_ns: _,
                 market_id,
@@ -321,6 +464,13 @@ impl BotState {
                 outcome,
             } => self.on_market_resolved(market_id, market_slug, end_epoch, outcome),
         }
+    }
+
+    fn on_binance_trade(&mut self, qty: f64, buyer_is_taker: bool) {
+        let now_s = now_epoch_secs_f64();
+        self.binance_volume_60s_stats.observe(now_s, qty);
+        let signed_qty = if buyer_is_taker { qty } else { -qty };
+        self.binance_flow_60s_stats.observe(now_s, signed_qty);
     }
 
     fn on_btc_tick(&mut self, t_ns: u128, mid_usd: f64) {
@@ -346,6 +496,24 @@ impl BotState {
         }
     }
 
+    fn persist_snapshot(&mut self) {
+        let Some(persister) = self.state_persister.as_mut() else {
+            return;
+        };
+        let snap = crate::state_persist::snapshot(
+            &self.session_id,
+            BOT_VERSION,
+            self.bankroll_usd,
+            self.positions.total_realised(),
+            self.positions.open_positions(),
+            self.risk.cumulative_notional_map(),
+            self.positions.realised_pnl_map(),
+        );
+        if let Err(e) = persister.write(&snap) {
+            warn!(error = %e, "failed to write state snapshot");
+        }
+    }
+
     fn on_market_resolved(
         &mut self,
         market_id: MarketId,
@@ -364,6 +532,15 @@ impl BotState {
         // Snapshot the open position (if any) BEFORE settling.
         let position_snapshot = self.positions.get(&market_id).cloned();
         let settled_pnl = self.positions.settle_resolution(&market_id, outcome);
+        // Update tracked bankroll: cost basis was reserved on each fill,
+        // proceeds are returned now. Net bankroll delta = settled_pnl
+        // (which already nets cost vs proceeds) + cost_basis_returned.
+        // Since we deducted cost_usd on each fill from bankroll and
+        // settle_resolution returns (proceeds - cost), the delta to
+        // bankroll on settle is `proceeds = cost + pnl`.
+        if let (Some(pos), Some(pnl)) = (position_snapshot.as_ref(), settled_pnl) {
+            self.bankroll_usd += pos.cost_usd + pnl;
+        }
 
         let position_side = position_snapshot
             .as_ref()
@@ -372,9 +549,10 @@ impl BotState {
         let position_cost_usd = position_snapshot.as_ref().map(|p| p.cost_usd);
         let position_avg_price = position_snapshot.as_ref().map(|p| p.avg_price);
         let winning_side = position_snapshot.as_ref().map(|p| p.side == outcome);
-        let settled_proceeds_usd = position_snapshot
-            .as_ref()
-            .map(|p| if p.side == outcome { p.shares } else { 0.0 });
+        let settled_proceeds_usd =
+            position_snapshot
+                .as_ref()
+                .map(|p| if p.side == outcome { p.shares } else { 0.0 });
 
         info!(
             event = "market_resolved",
@@ -408,9 +586,16 @@ impl BotState {
                 warn!(error = %e, "failed to write resolution record");
             }
         }
+        self.persist_snapshot();
     }
 
     fn on_poly_book(&mut self, market_id: MarketId, snapshot: PolyBookSnapshot) {
+        // Update aggregate spread stats from EVERY observed YES spread,
+        // regardless of which market — this builds the cross-market
+        // baseline used by the `yes_spread_z` feature.
+        if let Some(sp) = snapshot.yes_spread() {
+            self.yes_spread_stats.observe(now_epoch_secs_f64(), sp);
+        }
         let Some(am) = self.active.as_mut() else {
             return;
         };
@@ -419,8 +604,6 @@ impl BotState {
             return;
         }
         am.last_poly_snapshot = Some(snapshot);
-        // Strategy evaluation is driven by the FV timer, not the book
-        // event. Just stash the latest book here.
     }
 
     /// Build the [`Features`] snapshot for the scoring model from current
@@ -446,7 +629,9 @@ impl BotState {
         // Multi-window BTC drift Z-scores.
         let drift = |window: f64, vol: &VolEstimator, hist: &BtcHistory| -> Option<f64> {
             let r = hist.log_return_over(window)?;
-            let s = vol.sigma_per_sec().filter(|s| s.is_finite() && *s > 1e-10)?;
+            let s = vol
+                .sigma_per_sec()
+                .filter(|s| s.is_finite() && *s > 1e-10)?;
             let sigma_t = s * window.sqrt();
             if sigma_t > 0.0 {
                 Some(r / sigma_t)
@@ -457,6 +642,14 @@ impl BotState {
         f.btc_drift_5s_z = drift(5.0, &self.vol.w5, &self.btc_history);
         f.btc_drift_30s_z = drift(30.0, &self.vol.w30, &self.btc_history);
         f.btc_drift_60s_z = drift(60.0, &self.vol.w60, &self.btc_history);
+
+        // Momentum: short-window drift minus long-window drift, both in σ units.
+        // Captures acceleration / short-vs-long trend divergence.
+        let drift_300s_z = drift(300.0, &self.vol.w300, &self.btc_history);
+        f.btc_momentum = match (f.btc_drift_30s_z, drift_300s_z) {
+            (Some(s), Some(l)) => Some(s - l),
+            _ => None,
+        };
 
         // Polymarket book features.
         if let Some(snap) = am.last_poly_snapshot.as_ref() {
@@ -472,10 +665,20 @@ impl BotState {
                     f.no_book_imbalance = Some((bs - asz) / total);
                 }
             }
+            // Spread z-score against rolling distribution. Self-adapts as
+            // typical Polymarket spreads change across regimes.
             if let Some(spread) = snap.yes_spread() {
-                let base = self.cfg.strategy.spread_baseline.max(1e-9);
-                f.yes_spread_normalized = Some((spread - base) / base);
+                f.yes_spread_z = self.yes_spread_stats.z_score(spread);
             }
+        }
+
+        // Binance volume + flow over last 60s. Volume is raw BTC qty;
+        // flow imbalance is already normalised in [-1, 1].
+        let vol_sum = self.binance_volume_60s_stats.sum();
+        if vol_sum > 0.0 {
+            f.binance_volume_60s_btc = Some(vol_sum);
+            let signed = self.binance_flow_60s_stats.sum();
+            f.binance_flow_imbalance_60s = Some(signed / vol_sum);
         }
 
         // lag_yes deliberately left None in v1 — needs a separate
@@ -558,12 +761,10 @@ impl BotState {
         // Binance reference.
         let (latest_btc, btc_age_ms) = match self.btc_history.latest() {
             Some((_t, mid)) => {
-                let age_ms = self
-                    .last_btc_tick_ns
-                    .map(|t_ns| {
-                        let now_ns = common::LocalTimestamp::now().as_nanos();
-                        now_ns.saturating_sub(t_ns) as f64 / 1.0e6
-                    });
+                let age_ms = self.last_btc_tick_ns.map(|t_ns| {
+                    let now_ns = common::LocalTimestamp::now().as_nanos();
+                    now_ns.saturating_sub(t_ns) as f64 / 1.0e6
+                });
                 (Some(mid), age_ms)
             }
             None => (None, None),
@@ -605,8 +806,7 @@ impl BotState {
         }
         if let (Some(btc), Some(mid)) = (latest_btc, yes_mid) {
             if ttr > 0.0 {
-                rec.implied_strike_usd =
-                    implied_strike(btc, ttr.max(1.0), sigma_used, mid);
+                rec.implied_strike_usd = implied_strike(btc, ttr.max(1.0), sigma_used, mid);
                 if let (Some(impl_k), Some(k)) = (rec.implied_strike_usd, strike) {
                     rec.strike_gap_usd = Some(impl_k - k);
                     if k > 0.0 {
@@ -634,85 +834,105 @@ impl BotState {
         rec.feat_btc_drift_60s_z = features.btc_drift_60s_z;
         rec.feat_yes_book_imbalance = features.yes_book_imbalance;
         rec.feat_no_book_imbalance = features.no_book_imbalance;
-        rec.feat_yes_spread_normalized = features.yes_spread_normalized;
+        rec.feat_yes_spread_z = features.yes_spread_z;
+        rec.feat_btc_momentum = features.btc_momentum;
+        rec.feat_binance_volume_60s_btc = features.binance_volume_60s_btc;
+        rec.feat_binance_flow_imbalance_60s = features.binance_flow_imbalance_60s;
+
+        // Data-quality gates — refuse to evaluate on stale or
+        // implausible inputs. These run BEFORE the
+        // strike/scoring/decide branches because a stale tick can't be
+        // recovered by the strategy.
+        let dq_block = check_data_quality(&rec, &self.cfg.strategy);
 
         // Decide on the outcome.
-        let outcome = match (strike, scoring_outcome) {
-            (None, _) => Outcome3::Incomplete(IncompleteReason::NoStrike),
-            (Some(_), None) => Outcome3::Incomplete(IncompleteReason::NoBtcMid),
-            (Some(_), Some(s_out)) => {
-                if ttr <= 0.0 {
-                    Outcome3::Incomplete(IncompleteReason::TtrNonPositive)
-                } else if am.last_poly_snapshot.is_none() {
-                    Outcome3::Incomplete(IncompleteReason::NoPolyYesMid)
-                } else {
-                    let snap = am.last_poly_snapshot.as_ref().unwrap();
-                    // Diagnostic: log required edges at each side's ask.
-                    if let Some(a) = snap.yes_ask {
-                        rec.taker_required_edge_yes =
-                            Some(taker_required_edge(a, &self.cfg.strategy));
-                    }
-                    if let Some(a) = snap.no_ask {
-                        rec.taker_required_edge_no =
-                            Some(taker_required_edge(a, &self.cfg.strategy));
-                    }
-                    let strat = decide(
-                        DecisionInputs {
-                            market_id: &am.market.id,
-                            scoring_outcome: s_out,
-                            poly_yes_bid: snap.yes_bid,
-                            poly_yes_ask: snap.yes_ask,
-                            poly_no_bid: snap.no_bid,
-                            poly_no_ask: snap.no_ask,
-                            ttr_secs: ttr,
-                            max_per_trade_usd: self.cfg.risk.max_per_trade_usd,
-                        },
-                        &self.cfg.strategy,
-                    );
-                    match strat {
-                        StrategyOutcome::Fire(signal) => {
-                            let mark_mid = match signal.side {
-                                Outcome::Yes => snap.yes_mid(),
-                                Outcome::No => snap.no_mid(),
-                            };
-                            match self.risk.evaluate(
-                                signal.clone(),
-                                &self.positions,
-                                &self.cfg.risk,
-                                mark_mid,
-                                now_s,
-                            ) {
-                                RiskDecision::Approve(approved) => {
-                                    let fill = self
-                                        .executor
-                                        .submit(approved.clone(), &mut self.positions);
-                                    self.risk
-                                        .record_fill(approved.market_id.clone(), now_s);
-                                    info!(
-                                        event = "paper_fill",
-                                        market_id = %approved.market_id,
-                                        slug = %am.market.slug,
-                                        side = ?approved.side,
-                                        size_usd = format!("{:.4}", approved.size_usd),
-                                        price = format!("{:.4}", fill.fill_price),
-                                        edge = format!("{:.4}", approved.edge),
-                                        "paper fill"
-                                    );
-                                    Outcome3::Fired {
-                                        side: approved.side,
-                                        size_usd: fill.fill_size_usd,
-                                        price: fill.fill_price,
-                                    }
-                                }
-                                RiskDecision::Reject(reason) => Outcome3::Rejected {
-                                    reason: reject_reason_to_str(&reason).to_string(),
-                                    side: signal.side,
-                                    intended_size_usd: signal.size_usd,
-                                    intended_price: signal.price,
-                                },
-                            }
+        let outcome = if let Some(reason) = dq_block {
+            Outcome3::Incomplete(reason)
+        } else {
+            match (strike, scoring_outcome) {
+                (None, _) => Outcome3::Incomplete(IncompleteReason::NoStrike),
+                (Some(_), None) => Outcome3::Incomplete(IncompleteReason::NoBtcMid),
+                (Some(_), Some(s_out)) => {
+                    if ttr <= 0.0 {
+                        Outcome3::Incomplete(IncompleteReason::TtrNonPositive)
+                    } else if am.last_poly_snapshot.is_none() {
+                        Outcome3::Incomplete(IncompleteReason::NoPolyYesMid)
+                    } else {
+                        let snap = am.last_poly_snapshot.as_ref().unwrap();
+                        // Diagnostic: log required edges at each side's ask.
+                        if let Some(a) = snap.yes_ask {
+                            rec.taker_required_edge_yes =
+                                Some(taker_required_edge(a, &self.cfg.strategy));
                         }
-                        StrategyOutcome::NoSignal(reason) => Outcome3::NoSignal { reason },
+                        if let Some(a) = snap.no_ask {
+                            rec.taker_required_edge_no =
+                                Some(taker_required_edge(a, &self.cfg.strategy));
+                        }
+                        let strat = decide(
+                            DecisionInputs {
+                                market_id: &am.market.id,
+                                scoring_outcome: s_out,
+                                poly_yes_bid: snap.yes_bid,
+                                poly_yes_ask: snap.yes_ask,
+                                poly_no_bid: snap.no_bid,
+                                poly_no_ask: snap.no_ask,
+                                ttr_secs: ttr,
+                                max_per_trade_usd: self.cfg.risk.max_per_trade_usd,
+                                bankroll_usd: self.bankroll_usd,
+                            },
+                            &self.cfg.strategy,
+                        );
+                        match strat {
+                            StrategyOutcome::Fire(signal) => {
+                                let mark_mid = match signal.side {
+                                    Outcome::Yes => snap.yes_mid(),
+                                    Outcome::No => snap.no_mid(),
+                                };
+                                match self.risk.evaluate(
+                                    signal.clone(),
+                                    &self.positions,
+                                    &self.cfg.risk,
+                                    mark_mid,
+                                    now_s,
+                                ) {
+                                    RiskDecision::Approve(approved) => {
+                                        let fill = self
+                                            .executor
+                                            .submit(approved.clone(), &mut self.positions);
+                                        // Deduct cost from bankroll (we now hold shares, not cash).
+                                        self.bankroll_usd -= fill.fill_size_usd;
+                                        self.risk.record_fill(
+                                            approved.market_id.clone(),
+                                            fill.fill_size_usd,
+                                            now_s,
+                                        );
+                                        self.persist_snapshot();
+                                        info!(
+                                            event = "paper_fill",
+                                            market_id = %approved.market_id,
+                                            slug = %am.market.slug,
+                                            side = ?approved.side,
+                                            size_usd = format!("{:.4}", approved.size_usd),
+                                            price = format!("{:.4}", fill.fill_price),
+                                            edge = format!("{:.4}", approved.edge),
+                                            "paper fill"
+                                        );
+                                        Outcome3::Fired {
+                                            side: approved.side,
+                                            size_usd: fill.fill_size_usd,
+                                            price: fill.fill_price,
+                                        }
+                                    }
+                                    RiskDecision::Reject(reason) => Outcome3::Rejected {
+                                        reason: reject_reason_to_str(&reason).to_string(),
+                                        side: signal.side,
+                                        intended_size_usd: signal.size_usd,
+                                        intended_price: signal.price,
+                                    },
+                                }
+                            }
+                            StrategyOutcome::NoSignal(reason) => Outcome3::NoSignal { reason },
+                        }
                     }
                 }
             }
@@ -752,11 +972,25 @@ impl BotState {
             }
         }
 
+        // Bump the per-kind decision counter for /metrics.
+        use crate::metrics::DecisionKindMetric;
+        let metric_kind = match rec.decision_kind {
+            DecisionKind::Fire => DecisionKindMetric::Fire,
+            DecisionKind::Rejected => DecisionKindMetric::Rejected,
+            DecisionKind::NoSignal => DecisionKindMetric::NoSignal,
+            DecisionKind::Incomplete => DecisionKindMetric::Incomplete,
+        };
+        self.metrics.record_decision(metric_kind);
+
         if let Some(logger) = self.logger.as_mut() {
             if let Err(e) = logger.write(&rec) {
                 warn!(error = %e, "failed to write decision record");
             }
         }
+
+        // Sync gauges. Counter was bumped above so the snapshot is
+        // self-consistent for the next scrape.
+        self.refresh_metrics();
     }
 
     fn emit_status(&self) {
@@ -788,8 +1022,13 @@ impl BotState {
             open_positions = self.positions.open_count(),
             total_fills = self.executor.fill_count(),
             total_realised_pnl_usd = format!("{:.4}", self.positions.total_realised()),
+            bankroll_usd = format!("{:.4}", self.bankroll_usd),
+            kill_switch_tripped = self.risk.is_kill_switch_tripped(),
             "status"
         );
+        // Keep metrics snapshot fresh even on ticks where the FV path
+        // didn't refresh (e.g. when running but no active market).
+        self.refresh_metrics();
     }
 }
 
@@ -816,6 +1055,43 @@ fn side_to_str(o: Outcome) -> &'static str {
         Outcome::Yes => "yes",
         Outcome::No => "no",
     }
+}
+
+/// Data-quality gates. Refuse to evaluate the strategy on stale or
+/// implausible inputs. Returns the first failing reason, or `None` if
+/// all checks pass. Run BEFORE strike/scoring/decide because no
+/// downstream stage can recover from a stale tick.
+///
+/// Gates:
+/// * Binance tick age — protects against trading the strike off a
+///   disconnected upstream feed.
+/// * Polymarket book age — protects against firing into a stale book
+///   where our edge calc is using an obsolete price.
+/// * σ sanity — only checked when σ was estimated (the fallback is by
+///   definition within range). Out-of-range σ usually indicates a venue
+///   glitch the vol estimator picked up.
+pub fn check_data_quality(
+    rec: &DecisionRecord,
+    strategy: &crate::config::StrategyConfig,
+) -> Option<IncompleteReason> {
+    if let Some(age) = rec.btc_last_update_age_ms {
+        if age / 1000.0 > strategy.max_btc_tick_age_secs {
+            return Some(IncompleteReason::StaleBinanceFeed);
+        }
+    }
+    if let Some(age) = rec.poly_book_age_ms {
+        if age / 1000.0 > strategy.max_poly_book_age_secs {
+            return Some(IncompleteReason::StalePolyBook);
+        }
+    }
+    if rec.sigma_source.as_deref() == Some("estimated") {
+        if let Some(s) = rec.sigma_per_sec_used {
+            if !(strategy.min_sigma_per_sec..=strategy.max_sigma_per_sec).contains(&s) {
+                return Some(IncompleteReason::SigmaOutOfRange);
+            }
+        }
+    }
+    None
 }
 
 /// Build a record with the market-identity fields populated. Other
@@ -870,7 +1146,10 @@ fn base_record(am: &ActiveMarket, session_id: &str, now_s: f64) -> DecisionRecor
         feat_btc_drift_60s_z: None,
         feat_yes_book_imbalance: None,
         feat_no_book_imbalance: None,
-        feat_yes_spread_normalized: None,
+        feat_yes_spread_z: None,
+        feat_btc_momentum: None,
+        feat_binance_volume_60s_btc: None,
+        feat_binance_flow_imbalance_60s: None,
         taker_required_edge_yes: None,
         taker_required_edge_no: None,
         implied_strike_usd: None,
@@ -994,6 +1273,7 @@ pub async fn run_synthetic_demo(cfg: BotConfig) {
                 poly_no_ask: Some(no_ask),
                 ttr_secs: ttr,
                 max_per_trade_usd: cfg.risk.max_per_trade_usd,
+                bankroll_usd: cfg.risk.bankroll_initial_usd,
             },
             &cfg.strategy,
         );
@@ -1008,7 +1288,7 @@ pub async fn run_synthetic_demo(cfg: BotConfig) {
             match risk.evaluate(sig.clone(), &positions, &cfg.risk, mark, t) {
                 RiskDecision::Approve(approved) => {
                     let fill = executor.submit(approved.clone(), &mut positions);
-                    risk.record_fill(approved.market_id.clone(), t);
+                    risk.record_fill(approved.market_id.clone(), fill.fill_size_usd, t);
                     info!(
                         event = "paper_fill",
                         t = format!("{:.1}", t),
@@ -1024,7 +1304,10 @@ pub async fn run_synthetic_demo(cfg: BotConfig) {
                 }
                 RiskDecision::Reject(reason) => {
                     use crate::risk::RejectReason;
-                    if matches!(reason, RejectReason::Cooldown | RejectReason::NotionalCapReached) {
+                    if matches!(
+                        reason,
+                        RejectReason::Cooldown | RejectReason::NotionalCapReached
+                    ) {
                         tracing::debug!(?reason, "signal rejected by risk");
                     } else {
                         warn!(?reason, "signal rejected by risk");
@@ -1037,7 +1320,11 @@ pub async fn run_synthetic_demo(cfg: BotConfig) {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
-    let winner = if btc > strike { Outcome::Yes } else { Outcome::No };
+    let winner = if btc > strike {
+        Outcome::Yes
+    } else {
+        Outcome::No
+    };
     if let Some(pnl) = positions.settle_resolution(&market_id, winner) {
         info!(
             event = "market_resolved",
@@ -1051,4 +1338,180 @@ pub async fn run_synthetic_demo(cfg: BotConfig) {
         total_realised_pnl_usd = format!("{:.4}", positions.total_realised()),
         "demo complete"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::StrategyConfig;
+
+    fn empty_record() -> DecisionRecord {
+        DecisionRecord {
+            schema_version: SCHEMA_VERSION,
+            local_ts_ns: "0".into(),
+            session_id: "test".into(),
+            bot_version: BOT_VERSION.into(),
+            market_id: "m".into(),
+            market_slug: "s".into(),
+            yes_token: "y".into(),
+            no_token: "n".into(),
+            end_epoch: 0,
+            effective_start_epoch: 0,
+            ttr_secs: 60.0,
+            binance_btc_mid_usd: None,
+            binance_strike_usd: None,
+            btc_last_update_age_ms: None,
+            btc_history_len: 0,
+            poly_yes_bid: None,
+            poly_yes_ask: None,
+            poly_yes_mid: None,
+            poly_yes_bid_size: None,
+            poly_yes_ask_size: None,
+            poly_yes_spread: None,
+            poly_no_bid: None,
+            poly_no_ask: None,
+            poly_no_mid: None,
+            poly_no_bid_size: None,
+            poly_no_ask_size: None,
+            poly_no_spread: None,
+            poly_book_age_ms: None,
+            btc_log_return_5s: None,
+            btc_log_return_30s: None,
+            btc_log_return_60s: None,
+            btc_log_return_300s: None,
+            sigma_per_sec_5s: None,
+            sigma_per_sec_30s: None,
+            sigma_per_sec_60s: None,
+            sigma_per_sec_300s: None,
+            time_bucket: None,
+            scoring_p_yes: None,
+            scoring_p_no: None,
+            scoring_raw: None,
+            scoring_regime: None,
+            feat_btc_strike_distance_z: None,
+            feat_btc_drift_5s_z: None,
+            feat_btc_drift_30s_z: None,
+            feat_btc_drift_60s_z: None,
+            feat_yes_book_imbalance: None,
+            feat_no_book_imbalance: None,
+            feat_yes_spread_z: None,
+            feat_btc_momentum: None,
+            feat_binance_volume_60s_btc: None,
+            feat_binance_flow_imbalance_60s: None,
+            taker_required_edge_yes: None,
+            taker_required_edge_no: None,
+            implied_strike_usd: None,
+            strike_gap_usd: None,
+            strike_gap_bps: None,
+            sigma_per_sec_used: None,
+            sigma_source: None,
+            vol_samples: 0,
+            fv_yes: None,
+            fv_no: None,
+            edge_yes: None,
+            decision_kind: DecisionKind::Incomplete,
+            decision_side: None,
+            decision_size_usd: None,
+            decision_price: None,
+            no_signal_reason: None,
+            reject_reason: None,
+            incomplete_reason: None,
+        }
+    }
+
+    #[test]
+    fn dq_passes_on_clean_record() {
+        let rec = empty_record();
+        let strategy = StrategyConfig::default();
+        assert!(check_data_quality(&rec, &strategy).is_none());
+    }
+
+    #[test]
+    fn dq_blocks_stale_binance_tick() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        // Default max_btc_tick_age_secs = 5.0 → 5000ms threshold.
+        rec.btc_last_update_age_ms = Some(6_000.0);
+        assert_eq!(
+            check_data_quality(&rec, &strategy),
+            Some(IncompleteReason::StaleBinanceFeed)
+        );
+    }
+
+    #[test]
+    fn dq_allows_fresh_binance_tick() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        rec.btc_last_update_age_ms = Some(1_000.0);
+        assert!(check_data_quality(&rec, &strategy).is_none());
+    }
+
+    #[test]
+    fn dq_blocks_stale_poly_book() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        // Default max_poly_book_age_secs = 3.0 → 3000ms threshold.
+        rec.poly_book_age_ms = Some(4_000.0);
+        assert_eq!(
+            check_data_quality(&rec, &strategy),
+            Some(IncompleteReason::StalePolyBook)
+        );
+    }
+
+    #[test]
+    fn dq_allows_fresh_poly_book() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        rec.poly_book_age_ms = Some(500.0);
+        assert!(check_data_quality(&rec, &strategy).is_none());
+    }
+
+    #[test]
+    fn dq_blocks_sigma_too_high() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        // Default max_sigma_per_sec = 1e-2.
+        rec.sigma_per_sec_used = Some(0.05);
+        rec.sigma_source = Some("estimated".into());
+        assert_eq!(
+            check_data_quality(&rec, &strategy),
+            Some(IncompleteReason::SigmaOutOfRange)
+        );
+    }
+
+    #[test]
+    fn dq_blocks_sigma_too_low() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        // Default min_sigma_per_sec = 1e-7.
+        rec.sigma_per_sec_used = Some(1e-10);
+        rec.sigma_source = Some("estimated".into());
+        assert_eq!(
+            check_data_quality(&rec, &strategy),
+            Some(IncompleteReason::SigmaOutOfRange)
+        );
+    }
+
+    #[test]
+    fn dq_ignores_out_of_range_when_sigma_is_fallback() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        // Fallback σ is "trusted" — out-of-range checks don't apply.
+        rec.sigma_per_sec_used = Some(0.5);
+        rec.sigma_source = Some("fallback".into());
+        assert!(check_data_quality(&rec, &strategy).is_none());
+    }
+
+    #[test]
+    fn dq_first_failing_reason_wins_btc_before_poly() {
+        let mut rec = empty_record();
+        let strategy = StrategyConfig::default();
+        // Both stale; the BTC check is first in the function, so it wins.
+        rec.btc_last_update_age_ms = Some(10_000.0);
+        rec.poly_book_age_ms = Some(10_000.0);
+        assert_eq!(
+            check_data_quality(&rec, &strategy),
+            Some(IncompleteReason::StaleBinanceFeed)
+        );
+    }
 }
