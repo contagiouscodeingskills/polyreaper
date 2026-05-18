@@ -784,80 +784,99 @@ async fn live_executor_submits_signed_order_and_reconciles_to_terminal_state() {
 }
 
 // ---------------------------------------------------------------------------
-// FV model — poly-anchored log-odds framing
+// FV model — BTC-only, validated against poly mid
 // ---------------------------------------------------------------------------
 
-/// Headline guarantee: with default weights, the bot's `p_yes` equals
-/// the poly mid exactly. This is the contract that lets us trust the
-/// model to never blow up on cold start — the worst case is "we agree
-/// with the market" until a feature weight is set.
+/// Default model produces a sensible probability from a clean BTC
+/// state: BTC near strike + neutral microstructure → close to 0.5.
 #[test]
-fn default_scoring_recovers_poly_mid_within_floating_point_noise() {
+fn default_scoring_at_strike_with_neutral_features_is_roughly_half() {
     let cfg = ScoringConfig::default();
-    for poly_mid in [0.05, 0.20, 0.35, 0.50, 0.65, 0.80, 0.95] {
-        let features = Features {
-            poly_mid: Some(poly_mid),
-            ..Default::default()
-        };
-        for regime in [Regime::Early, Regime::Mid, Regime::Late] {
-            let out = score(&features, regime, &cfg).expect("scored");
-            let gap = (out.p_yes - poly_mid).abs();
-            assert!(
-                gap < 1e-9,
-                "default FV must equal poly_mid (regime={:?}, poly={poly_mid}, fv={}, gap={gap})",
-                regime,
-                out.p_yes,
-            );
-        }
-    }
-}
-
-/// A non-trivial weight on a single feature should produce a small,
-/// bounded correction — NEVER a 60c-vs-30c gap. This is the
-/// quantitative version of the user's "model is off" intuition.
-#[test]
-fn small_correction_weights_stay_within_a_few_percentage_points_of_poly() {
-    let mut cfg = ScoringConfig::default();
-    // Set modest weights on three orthogonal correction features.
-    cfg.mid.w_btc_momentum = 0.20;
-    cfg.mid.w_btc_drift_30s_z = 0.20;
-    cfg.mid.w_yes_book_imbalance = 0.20;
     let features = Features {
-        poly_mid: Some(0.40),
-        btc_momentum: Some(1.0),       // +1σ momentum
-        btc_drift_30s_z: Some(1.0),    // +1σ recent drift
-        yes_book_imbalance: Some(0.5), // bid-heavy
+        btc_strike_distance_z: Some(0.0),  // BTC == strike
+        btc_drift_30s_z: Some(0.0),
+        binance_flow_imbalance_60s: Some(0.0),
+        btc_momentum: Some(0.0),
         ..Default::default()
     };
     let out = score(&features, Regime::Mid, &cfg).expect("scored");
-    let gap = out.p_yes - 0.40;
-    assert!(
-        gap > 0.0 && gap < 0.15,
-        "positive corrections should lift FV above poly within ~15pp; got fv={}, gap={gap}",
-        out.p_yes,
-    );
+    assert!((out.p_yes - 0.5).abs() < 1e-9, "got {}", out.p_yes);
 }
 
-/// Extreme weights CAN produce a wild gap — that's the failure mode
-/// the divergence DQ gate exists to catch. Test it explicitly.
+/// BTC strongly above strike + bullish flow → model says YES very
+/// likely, with no input from poly at all. This is the bot doing its
+/// own thinking.
 #[test]
-fn extreme_weights_can_produce_wild_gap_demonstrating_the_need_for_dq_gate() {
-    let mut cfg = ScoringConfig::default();
-    cfg.mid.w_btc_momentum = 5.0; // pathological weight
+fn btc_above_strike_with_bullish_flow_predicts_yes_independently_of_poly() {
+    let cfg = ScoringConfig::default();
     let features = Features {
-        poly_mid: Some(0.30),
-        btc_momentum: Some(1.0),
+        btc_strike_distance_z: Some(1.5),       // BTC clearly above strike
+        btc_drift_30s_z: Some(1.0),             // recent upward drift
+        binance_flow_imbalance_60s: Some(0.6),  // aggressive buyers
+        btc_momentum: Some(0.8),                // accelerating
+        // Note: NO poly_mid input.
         ..Default::default()
     };
     let out = score(&features, Regime::Mid, &cfg).expect("scored");
-    let gap = (out.p_yes - 0.30).abs();
-    // raw = logit(0.30) + 5×1 ≈ 4.15 → sigmoid ≈ 0.984. Gap ≈ 0.68.
+    // raw = 1.0×1.5 + 0.30×1.0 + 0.40×0.6 + 0.15×0.8
+    //     = 1.5 + 0.30 + 0.24 + 0.12 = 2.16
+    // sigmoid(2.16) ≈ 0.897
     assert!(
-        gap > 0.50,
-        "extreme weight should produce huge gap (model is broken)"
+        out.p_yes > 0.85,
+        "strong bullish BTC state should produce high p_yes; got {}",
+        out.p_yes
     );
+}
+
+/// Model and poly being CLOSE is the calibration we care about — but
+/// it's measured externally, not enforced as an input. This test
+/// simulates a tick where BTC features yield a probability near poly's
+/// observed mid (which lives only in the bot's calibration tracker).
+#[test]
+fn model_close_to_poly_demonstrates_calibration() {
+    let cfg = ScoringConfig::default();
+    // Suppose poly is trading at 0.55 (YES slight favorite) and BTC
+    // signals are mildly bullish. A calibrated model should produce
+    // ~0.55 ± a few percent.
+    let features = Features {
+        btc_strike_distance_z: Some(0.2),
+        btc_drift_30s_z: Some(0.3),
+        binance_flow_imbalance_60s: Some(0.1),
+        btc_momentum: Some(0.0),
+        ..Default::default()
+    };
+    let out = score(&features, Regime::Mid, &cfg).expect("scored");
+    // raw = 1.0×0.2 + 0.30×0.3 + 0.40×0.1 + 0.15×0 = 0.33
+    // sigmoid(0.33) ≈ 0.582
+    let imagined_poly_mid = 0.55;
+    let gap = (out.p_yes - imagined_poly_mid).abs();
+    assert!(
+        gap < 0.05,
+        "modestly bullish BTC features should produce p_yes close to poly's view (poly~0.55, fv={}, gap={gap})",
+        out.p_yes
+    );
+}
+
+/// Bad weights → wild model output → calibration gap explodes. This
+/// is exactly the "60-vs-30" scenario: poly says 30c, model says ~95c,
+/// which the divergence DQ gate catches before any trade goes out.
+#[test]
+fn pathological_weights_blow_up_the_gap_demonstrating_dq_gate_need() {
+    let mut cfg = ScoringConfig::default();
+    cfg.mid.w_btc_drift_30s_z = 5.0; // pathological weight
+    let features = Features {
+        btc_strike_distance_z: Some(0.0),
+        btc_drift_30s_z: Some(1.0),
+        ..Default::default()
+    };
+    let out = score(&features, Regime::Mid, &cfg).expect("scored");
+    // raw ≈ 5.0 → sigmoid(5.0) ≈ 0.993
+    assert!(out.p_yes > 0.95);
+    // If poly is at 0.30 (the user's example), gap is 0.99 - 0.30 ≈ 0.69.
+    let imagined_poly_mid = 0.30;
+    let gap = (out.p_yes - imagined_poly_mid).abs();
+    assert!(gap > 0.60, "this is the 'fv=99 poly=30' broken-model scenario");
     // The DQ gate with default `max_fv_divergence_pp = 0.10` would
-    // refuse to fire on this — assert that contract holds.
-    assert!(gap > 0.10, "this is exactly the 'fv=60 poly=30' scenario");
+    // refuse to fire on this.
 }
 

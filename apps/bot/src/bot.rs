@@ -780,11 +780,12 @@ impl BotState {
             _ => None,
         };
 
-        // Polymarket book features.
+        // Polymarket book features. Note: we use BOOK SIZES (bid/ask
+        // imbalance, spread) but intentionally NOT poly's mid as a
+        // model input — the bot derives its own probability from BTC
+        // and compares to poly externally (see ModelDivergence DQ
+        // gate + calibration metrics).
         if let Some(snap) = am.last_poly_snapshot.as_ref() {
-            // Anchor feature: poly's YES mid. Drives the log-odds
-            // model — `p_yes = poly_mid` exactly under default weights.
-            f.poly_mid = snap.yes_mid();
             if let (Some(bs), Some(asz)) = (snap.yes_bid_size, snap.yes_ask_size) {
                 let total = bs + asz;
                 if total > 0.0 {
@@ -988,11 +989,17 @@ impl BotState {
         rec.feat_binance_volume_60s_btc = features.binance_volume_60s_btc;
         rec.feat_binance_flow_imbalance_60s = features.binance_flow_imbalance_60s;
 
-        // Calibration check: how far is our FV from poly's mid?
-        // Tracked every tick (whether we fire or not) so the rolling
-        // calibration metric reflects the model's true accuracy, not
-        // just accuracy on tradeable ticks.
-        let fv_minus_poly = match (scoring_outcome, features.poly_mid) {
+        // Calibration check: how far is OUR FV from poly's mid?
+        // Poly mid isn't a model input — it's the reference benchmark
+        // we use to detect when our BTC-only model has gone off the
+        // rails. The metric is tracked every tick (whether we fire
+        // or not) so the rolling stats reflect the model's true
+        // accuracy, not just accuracy on tradeable ticks.
+        let poly_yes_mid_now = am
+            .last_poly_snapshot
+            .as_ref()
+            .and_then(|s| s.yes_mid());
+        let fv_minus_poly = match (scoring_outcome, poly_yes_mid_now) {
             (Some(s), Some(p)) => {
                 let gap = s.p_yes - p;
                 self.fv_poly_gap_stats.observe(now_s, gap);
