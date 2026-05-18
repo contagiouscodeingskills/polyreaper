@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use bot::bot::run_paper;
 use bot::config::BotConfig;
+use bot::live::client::ApiCredentials;
 use bot::live::{LiveCredentials, LiveExecError, LiveExecutor};
 
 #[tokio::main]
@@ -27,14 +28,23 @@ async fn main() {
     // worst possible failure mode (the user thinks they're trading
     // and isn't).
     if cfg.mode == bot::config::Mode::Live {
-        match LiveExecutor::new(LiveCredentials::from_env()) {
-            Ok(_exec) => {
-                // Once the live executor's `submit` is implemented, the
-                // bot orchestrator should be invoked with it here.
+        match LiveExecutor::new(
+            LiveCredentials::from_env(),
+            ApiCredentials::from_env(),
+            cfg.feeds.polymarket.clob_url.clone(),
+        ) {
+            Ok(exec) => {
+                info!(
+                    signer = %exec.signer_address_hex(),
+                    proxy = %exec.proxy_wallet_address(),
+                    "Mode::Live: credentials present and live executor initialised"
+                );
+                // `run_live` orchestration is the next step (Phase B);
+                // until that lands the bot must NOT silently fall back
+                // to paper.
                 warn!(
-                    "Mode::Live: credentials present but live executor is not yet \
-                     implemented (Phase 7 scaffold only). Refusing to start. Set \
-                     mode = \"paper\" or finish wiring `LiveExecutor::submit`."
+                    "Mode::Live: executor ready but the live orchestrator \
+                     (`run_live`) is not yet wired. Refusing to start."
                 );
                 std::process::exit(2);
             }
@@ -43,6 +53,15 @@ async fn main() {
                     "Mode::Live but POLYMARKET_EOA_PRIVATE_KEY / \
                      POLYMARKET_PROXY_WALLET_ADDRESS are not set. Refusing to \
                      start (silent paper fallback would be unsafe)."
+                );
+                std::process::exit(2);
+            }
+            Err(LiveExecError::ApiCredentialsMissing) => {
+                warn!(
+                    "Mode::Live but POLYMARKET_API_KEY / POLYMARKET_API_SECRET / \
+                     POLYMARKET_API_PASSPHRASE are not set. Run \
+                     `py-clob-client` (or equivalent) once with your EOA key \
+                     to mint these, then set them in the environment."
                 );
                 std::process::exit(2);
             }

@@ -37,6 +37,7 @@
 //! will panic-bail before any feed is opened. The intent is **loud
 //! failure**: no silent fallback to paper.
 
+pub mod client;
 pub mod signing;
 
 use std::collections::HashMap;
@@ -113,9 +114,10 @@ pub struct LiveOrder {
 /// actually holds funds and matches in the CLOB.
 #[derive(Clone)]
 pub struct LiveCredentials {
-    // The private key is held here for the eventual signing path
-    // (currently stubbed). Not exposed via any public getter.
-    #[allow(dead_code)]
+    // Private; only `eoa_private_key_for_signing()` exposes it as a
+    // `&str` to the signing module (which immediately hashes it into a
+    // `Wallet` so the key bytes don't live in plain memory longer
+    // than necessary).
     eoa_private_key: String,
     proxy_wallet_address: String,
 }
@@ -149,6 +151,13 @@ impl LiveCredentials {
     pub fn proxy_wallet_address(&self) -> &str {
         &self.proxy_wallet_address
     }
+
+    /// Expose the EOA private key for the signing module. Crate-internal
+    /// only; never serialised, never logged. Callers must immediately
+    /// hash it into a [`signing::Wallet`].
+    pub(crate) fn eoa_private_key_for_signing(&self) -> &str {
+        &self.eoa_private_key
+    }
 }
 
 impl std::fmt::Debug for LiveCredentials {
@@ -166,34 +175,78 @@ impl std::fmt::Debug for LiveCredentials {
 pub enum LiveExecError {
     #[error("live mode requires POLYMARKET_EOA_PRIVATE_KEY and POLYMARKET_PROXY_WALLET_ADDRESS env vars")]
     CredentialsMissing,
+    #[error("live mode requires POLYMARKET_API_KEY, POLYMARKET_API_SECRET and POLYMARKET_API_PASSPHRASE env vars")]
+    ApiCredentialsMissing,
     #[error("live executor method `{0}` is not yet implemented")]
     NotImplemented(&'static str),
     #[error("venue rejected order: {0}")]
     VenueReject(String),
     #[error("network error: {0}")]
     Network(String),
+    #[error("invalid configuration: {0}")]
+    BadConfig(String),
 }
 
-/// Live executor — same shape as `PaperExecutor`. All trade-side methods
-/// are stubs returning `NotImplemented` until the EIP-712 signing path
-/// is wired.
+/// Per-market metadata the executor needs to convert a `Signal` into an
+/// EIP-712 order. Held by the orchestrator; passed in on each submit
+/// since one executor instance can place orders on many markets.
+#[derive(Debug, Clone)]
+pub struct MarketContext {
+    /// CTF token id for the YES outcome (decimal-string uint256).
+    pub yes_token_id: String,
+    /// CTF token id for the NO outcome.
+    pub no_token_id: String,
+    /// Whether this is a neg-risk market (changes the EIP-712 verifying
+    /// contract). Fetch from `GET /neg-risk?token_id=...` and cache.
+    pub neg_risk: bool,
+    /// Fee rate in basis points for this market — from `GET /fee-rate-bps`.
+    pub fee_rate_bps: u64,
+    /// Polygon chain id. `137` mainnet.
+    pub chain_id: u64,
+}
+
+/// Live executor — wraps a [`client::PolyClient`] with order-book
+/// bookkeeping. Submits real, signed orders to Polymarket's CLOB.
+///
+/// The executor is constructed at boot from `LiveCredentials` (EOA +
+/// proxy) and `ApiCredentials` (HMAC). All three values are required —
+/// `new()` returns `CredentialsMissing` or `ApiCredentialsMissing`
+/// otherwise.
 pub struct LiveExecutor {
     creds: LiveCredentials,
+    client: client::PolyClient,
     open: HashMap<LiveOrderId, LiveOrder>,
 }
 
 impl LiveExecutor {
-    /// Construct from credentials. Returns `CredentialsMissing` if `None`.
-    pub fn new(creds: Option<LiveCredentials>) -> Result<Self, LiveExecError> {
+    /// Construct from credentials + base URL. `clob_base_url` should be
+    /// `https://clob.polymarket.com` in production; tests can point at
+    /// a mock server.
+    pub fn new(
+        creds: Option<LiveCredentials>,
+        api_creds: Option<client::ApiCredentials>,
+        clob_base_url: impl Into<String>,
+    ) -> Result<Self, LiveExecError> {
         let creds = creds.ok_or(LiveExecError::CredentialsMissing)?;
+        let api_creds = api_creds.ok_or(LiveExecError::ApiCredentialsMissing)?;
+        let wallet = signing::Wallet::from_private_key_hex(creds.eoa_private_key_for_signing())
+            .map_err(|e| LiveExecError::BadConfig(format!("EOA private key: {e}")))?;
+        let funder = signing::parse_address(creds.proxy_wallet_address())
+            .map_err(|e| LiveExecError::BadConfig(format!("proxy address: {e}")))?;
+        let client = client::PolyClient::new(wallet, funder, api_creds, clob_base_url);
         Ok(Self {
             creds,
+            client,
             open: HashMap::new(),
         })
     }
 
     pub fn proxy_wallet_address(&self) -> &str {
         self.creds.proxy_wallet_address()
+    }
+
+    pub fn signer_address_hex(&self) -> String {
+        self.client.signer_address_hex()
     }
 
     pub fn open_count(&self) -> usize {
@@ -204,23 +257,122 @@ impl LiveExecutor {
         self.open.values().cloned().collect()
     }
 
-    /// Submit a signal as a real order. **Stub** — will sign + POST when
-    /// implemented. Today: always errors `NotImplemented`.
-    pub async fn submit(&mut self, _signal: Signal) -> Result<LiveOrderId, LiveExecError> {
-        Err(LiveExecError::NotImplemented("submit"))
+    /// Submit a strategy signal as a signed CLOB order. The market
+    /// metadata (token IDs, neg-risk flag, fee rate, chain) comes from
+    /// the orchestrator's per-market context. The signal's `side`
+    /// chooses YES vs NO token; the order itself is always a BUY
+    /// (we're long the side we believe in; selling happens at
+    /// resolution or via explicit close).
+    pub async fn submit(
+        &mut self,
+        signal: Signal,
+        ctx: &MarketContext,
+    ) -> Result<LiveOrderId, LiveExecError> {
+        let token_id = match signal.side {
+            Outcome::Yes => &ctx.yes_token_id,
+            Outcome::No => &ctx.no_token_id,
+        };
+        let size_shares = if signal.price > 0.0 {
+            signal.size_usd / signal.price
+        } else {
+            return Err(LiveExecError::BadConfig(format!(
+                "signal price must be > 0; got {}",
+                signal.price
+            )));
+        };
+        let req = client::OrderRequest {
+            side: signing::OrderSide::Buy,
+            token_id: token_id.clone(),
+            price: signal.price,
+            size_shares,
+            expiration_secs: 0,
+            fee_rate_bps: ctx.fee_rate_bps,
+            market_info: if ctx.neg_risk {
+                client::MarketInfo {
+                    neg_risk: true,
+                    chain_id: ctx.chain_id,
+                }
+            } else {
+                client::MarketInfo {
+                    neg_risk: false,
+                    chain_id: ctx.chain_id,
+                }
+            },
+        };
+        let salt: u128 = rand::random::<u64>() as u128;
+        let order_id = self
+            .client
+            .submit_order(&req, salt)
+            .await
+            .map_err(map_client_err)?;
+        let id = LiveOrderId::new(order_id);
+        let live = LiveOrder {
+            id: id.clone(),
+            market_id: signal.market_id.clone(),
+            side: signal.side,
+            limit_price: signal.price,
+            size_usd: signal.size_usd,
+            filled_size_usd: 0.0,
+            state: OrderState::Acked,
+        };
+        self.open.insert(id.clone(), live);
+        Ok(id)
     }
 
-    /// Cancel an order by venue ID. **Stub**.
-    pub async fn cancel(&mut self, _id: &LiveOrderId) -> Result<(), LiveExecError> {
-        Err(LiveExecError::NotImplemented("cancel"))
+    /// Cancel an order by venue ID. Sends a signed `DELETE /order` and
+    /// removes the order from local open-book on success.
+    pub async fn cancel(&mut self, id: &LiveOrderId) -> Result<(), LiveExecError> {
+        self.client
+            .cancel_order(id.as_str())
+            .await
+            .map_err(map_client_err)?;
+        if let Some(o) = self.open.get_mut(id) {
+            o.state = OrderState::Cancelled;
+        }
+        // Cancelled is terminal — drop from open book.
+        self.open.remove(id);
+        Ok(())
     }
 
-    /// Pull our open orders from the venue. **Stub** — returns
-    /// `NotImplemented` until the REST/WS client is wired.
-    pub async fn fetch_open_orders_from_venue(&self) -> Result<Vec<LiveOrder>, LiveExecError> {
-        Err(LiveExecError::NotImplemented(
-            "fetch_open_orders_from_venue",
-        ))
+    /// Pull our open orders from the venue. Used by the reconciliation
+    /// loop to drive `reconcile(local, venue)`.
+    pub async fn fetch_open_orders_from_venue(
+        &self,
+    ) -> Result<Vec<LiveOrder>, LiveExecError> {
+        let rows = self.client.fetch_open_orders().await.map_err(map_client_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            // Best-effort parse. Anything we can't map cleanly is
+            // skipped — the reconciler treats missing-on-venue as
+            // Rejected (terminal) which is safer than fabricating
+            // open state.
+            let id = LiveOrderId::new(row.id);
+            let side = match row.side.as_str() {
+                "BUY" => Outcome::Yes,
+                "SELL" => Outcome::No,
+                _ => continue,
+            };
+            let state = match row.status.as_str() {
+                "LIVE" => OrderState::Acked,
+                "MATCHED" | "FILLED" => OrderState::Filled,
+                "CANCELED" | "CANCELLED" => OrderState::Cancelled,
+                _ => OrderState::Acked,
+            };
+            let limit_price = row.price.parse::<f64>().unwrap_or(0.0);
+            let size_shares = row.original_size.parse::<f64>().unwrap_or(0.0);
+            let size_matched = row.size_matched.parse::<f64>().unwrap_or(0.0);
+            let market_id = market_registry::MarketId::new(row.market);
+            out.push(LiveOrder {
+                id,
+                market_id,
+                side,
+                limit_price,
+                size_usd: size_shares * limit_price,
+                filled_size_usd: size_matched * limit_price,
+                state,
+            });
+        }
+        Ok(out)
     }
 
     /// Apply a reconciler diff to our internal book. Pure — no network.
@@ -233,6 +385,17 @@ impl LiveExecutor {
         }
         // Remove terminal-state orders from the open book.
         self.open.retain(|_, o| !o.state.is_terminal());
+    }
+}
+
+fn map_client_err(e: client::ClientError) -> LiveExecError {
+    match e {
+        client::ClientError::Signing(s) => LiveExecError::BadConfig(s.to_string()),
+        client::ClientError::Http(s) => LiveExecError::Network(s),
+        client::ClientError::VenueReject { status, body } => {
+            LiveExecError::VenueReject(format!("HTTP {status}: {body}"))
+        }
+        client::ClientError::Parse(s) => LiveExecError::Network(format!("parse: {s}")),
     }
 }
 
@@ -309,39 +472,58 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_without_creds_errors_loudly() {
-        match LiveExecutor::new(None) {
-            Err(LiveExecError::CredentialsMissing) => {}
-            _ => panic!("expected CredentialsMissing"),
+    const TEST_EOA_KEY: &str =
+        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_PROXY_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    fn test_api_creds() -> client::ApiCredentials {
+        use base64::engine::general_purpose::URL_SAFE as B64URL;
+        use base64::Engine;
+        client::ApiCredentials {
+            api_key: "key".into(),
+            secret_b64url: B64URL.encode(b"secret-bytes-32-aaaaaaaaaaaaaaaa"),
+            passphrase: "pass".into(),
         }
     }
 
     #[test]
-    fn new_with_creds_succeeds() {
-        let creds = LiveCredentials::for_test("0xdeadbeef", "0xproxy");
-        let exec = LiveExecutor::new(Some(creds)).expect("should construct");
-        assert_eq!(exec.open_count(), 0);
-        assert_eq!(exec.proxy_wallet_address(), "0xproxy");
+    fn new_without_eoa_creds_errors_loudly() {
+        let res = LiveExecutor::new(None, Some(test_api_creds()), "http://x");
+        assert!(matches!(res, Err(LiveExecError::CredentialsMissing)));
     }
 
     #[test]
-    fn submit_is_stubbed() {
-        let creds = LiveCredentials::for_test("0xdeadbeef", "0xproxy");
-        let mut exec = LiveExecutor::new(Some(creds)).unwrap();
-        let sig = Signal {
-            market_id: MarketId::new("M"),
-            side: Outcome::Yes,
-            size_usd: 1.0,
-            price: 0.50,
-            fv_for_side: 0.60,
-            mid_for_side: 0.50,
-            edge: 0.10,
-            ttr_secs: 120.0,
-        };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let res = rt.block_on(exec.submit(sig));
-        assert!(matches!(res, Err(LiveExecError::NotImplemented("submit"))));
+    fn new_without_api_creds_errors_loudly() {
+        let creds = LiveCredentials::for_test(TEST_EOA_KEY, TEST_PROXY_ADDR);
+        let res = LiveExecutor::new(Some(creds), None, "http://x");
+        assert!(matches!(res, Err(LiveExecError::ApiCredentialsMissing)));
+    }
+
+    #[test]
+    fn new_with_creds_succeeds_and_exposes_addresses() {
+        let creds = LiveCredentials::for_test(TEST_EOA_KEY, TEST_PROXY_ADDR);
+        let exec = LiveExecutor::new(Some(creds), Some(test_api_creds()), "http://x")
+            .expect("should construct");
+        assert_eq!(exec.open_count(), 0);
+        assert_eq!(exec.proxy_wallet_address(), TEST_PROXY_ADDR);
+        // EOA derived from the Anvil test key.
+        assert_eq!(
+            exec.signer_address_hex().to_ascii_lowercase(),
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        );
+    }
+
+    #[test]
+    fn new_with_invalid_eoa_key_rejects_with_bad_config() {
+        let creds = LiveCredentials::for_test("not-hex", TEST_PROXY_ADDR);
+        let res = LiveExecutor::new(Some(creds), Some(test_api_creds()), "http://x");
+        match res {
+            Err(LiveExecError::BadConfig(msg)) => {
+                assert!(msg.to_lowercase().contains("private key"), "got: {msg}");
+            }
+            Err(other) => panic!("expected BadConfig, got {other:?}"),
+            Ok(_) => panic!("expected BadConfig, got Ok"),
+        }
     }
 
     #[test]
@@ -424,8 +606,9 @@ mod tests {
 
     #[test]
     fn apply_diff_drops_terminal_orders_from_open_book() {
-        let creds = LiveCredentials::for_test("k", "a");
-        let mut exec = LiveExecutor::new(Some(creds)).unwrap();
+        let creds = LiveCredentials::for_test(TEST_EOA_KEY, TEST_PROXY_ADDR);
+        let mut exec =
+            LiveExecutor::new(Some(creds), Some(test_api_creds()), "http://x").unwrap();
         exec.open
             .insert(LiveOrderId::new("A"), mk_order("A", OrderState::Acked, 0.0));
         exec.open
@@ -450,5 +633,184 @@ mod tests {
         let b = exec.open.get(&LiveOrderId::new("B")).unwrap();
         assert_eq!(b.state, OrderState::PartiallyFilled);
         assert!((b.filled_size_usd - 1.0).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end: a real Signal goes through LiveExecutor::submit and
+    // produces a signed POST against a one-shot mock server. Verifies
+    // the YES/NO token selection logic and that the on-success path
+    // updates the local open book.
+    // -----------------------------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn submit_signal_selects_yes_token_and_records_open_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut all = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+                // Found end of headers? Parse content-length and stop.
+                if let Some(pos) = all.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&all[..pos]).to_string();
+                    let cl: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let mut s = l.splitn(2, ':');
+                            let (n, v) = (s.next()?.trim(), s.next()?.trim());
+                            if n.eq_ignore_ascii_case("content-length") {
+                                v.parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while all.len() < pos + 4 + cl {
+                        let m = sock.read(&mut buf).await.unwrap();
+                        if m == 0 {
+                            break;
+                        }
+                        all.extend_from_slice(&buf[..m]);
+                    }
+                    let body = String::from_utf8_lossy(&all[pos + 4..]).to_string();
+                    // Verify the YES token was selected
+                    let parsed: client::SignedOrderRequest =
+                        serde_json::from_str(&body).expect("valid JSON");
+                    assert_eq!(parsed.order.token_id, "100200300", "YES token id");
+                    assert_eq!(parsed.order.side, "BUY");
+                    break;
+                }
+            }
+            let body = r#"{"success":true,"errorMsg":"","orderID":"0xabc123"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+        });
+
+        let creds = LiveCredentials::for_test(TEST_EOA_KEY, TEST_PROXY_ADDR);
+        let mut exec =
+            LiveExecutor::new(Some(creds), Some(test_api_creds()), format!("http://{addr}"))
+                .unwrap();
+
+        let signal = Signal {
+            market_id: MarketId::new("0xmkt"),
+            side: Outcome::Yes,
+            size_usd: 5.0,
+            price: 0.50,
+            fv_for_side: 0.60,
+            mid_for_side: 0.50,
+            edge: 0.10,
+            ttr_secs: 120.0,
+        };
+        let ctx = MarketContext {
+            yes_token_id: "100200300".into(),
+            no_token_id: "400500600".into(),
+            neg_risk: false,
+            fee_rate_bps: 0,
+            chain_id: 137,
+        };
+
+        let id = exec.submit(signal, &ctx).await.expect("submit ok");
+        assert_eq!(id.as_str(), "0xabc123");
+        // Internal open-book records the order.
+        assert_eq!(exec.open_count(), 1);
+        let order = exec.open_orders().pop().unwrap();
+        assert_eq!(order.id, id);
+        assert_eq!(order.side, Outcome::Yes);
+        assert_eq!(order.state, OrderState::Acked);
+        assert!((order.size_usd - 5.0).abs() < 1e-9);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn submit_signal_selects_no_token_when_side_is_no() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut all = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+                if let Some(pos) = all.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&all[..pos]).to_string();
+                    let cl: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let mut s = l.splitn(2, ':');
+                            let (n, v) = (s.next()?.trim(), s.next()?.trim());
+                            if n.eq_ignore_ascii_case("content-length") {
+                                v.parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while all.len() < pos + 4 + cl {
+                        let m = sock.read(&mut buf).await.unwrap();
+                        if m == 0 {
+                            break;
+                        }
+                        all.extend_from_slice(&buf[..m]);
+                    }
+                    let body = String::from_utf8_lossy(&all[pos + 4..]).to_string();
+                    let parsed: client::SignedOrderRequest =
+                        serde_json::from_str(&body).expect("valid JSON");
+                    // Critical: signal.side = No selects the NO token id.
+                    assert_eq!(parsed.order.token_id, "400500600", "NO token id");
+                    break;
+                }
+            }
+            let body = r#"{"success":true,"errorMsg":"","orderID":"0xdef456"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+        });
+
+        let creds = LiveCredentials::for_test(TEST_EOA_KEY, TEST_PROXY_ADDR);
+        let mut exec =
+            LiveExecutor::new(Some(creds), Some(test_api_creds()), format!("http://{addr}"))
+                .unwrap();
+        let signal = Signal {
+            market_id: MarketId::new("0xmkt"),
+            side: Outcome::No,
+            size_usd: 5.0,
+            price: 0.40,
+            fv_for_side: 0.50,
+            mid_for_side: 0.40,
+            edge: 0.10,
+            ttr_secs: 120.0,
+        };
+        let ctx = MarketContext {
+            yes_token_id: "100200300".into(),
+            no_token_id: "400500600".into(),
+            neg_risk: false,
+            fee_rate_bps: 0,
+            chain_id: 137,
+        };
+        let id = exec.submit(signal, &ctx).await.expect("submit ok");
+        assert_eq!(id.as_str(), "0xdef456");
+        server.await.unwrap();
     }
 }
