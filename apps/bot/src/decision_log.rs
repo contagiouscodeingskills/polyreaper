@@ -179,6 +179,12 @@ pub enum IncompleteReason {
     /// σ estimate is outside the sanity envelope (suggests vol-estimator
     /// is broken — refuse to derive FV from it).
     SigmaOutOfRange,
+    /// `|p_yes - poly_mid| > max_fv_divergence_pp`. The poly-anchored
+    /// log-odds model produced an FV too far from poly's consensus —
+    /// most likely a sign that learned weights have drifted, not that
+    /// we found alpha. Refuse to fire until the gap closes or the
+    /// operator reviews + resets weights.
+    ModelDivergence,
 }
 
 // ---------------------------------------------------------------------------

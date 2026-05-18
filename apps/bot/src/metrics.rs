@@ -52,6 +52,17 @@ pub struct MetricsSnapshot {
     pub decisions_rejected_total: u64,
     pub decisions_no_signal_total: u64,
     pub decisions_incomplete_total: u64,
+
+    /// Rolling-window mean of `(fv_p_yes − poly_mid)`. Probability
+    /// units, signed. Persistent non-zero values indicate the model
+    /// is biased; sign tells direction. Optional because it requires
+    /// enough samples to be meaningful.
+    pub fv_poly_gap_mean_pp: Option<f64>,
+    /// Rolling-window stdev of `(fv_p_yes − poly_mid)`. Probability
+    /// units. Large stdev means the model is volatile relative to
+    /// poly — could be informative (we're detecting fast moves) or
+    /// could be noise.
+    pub fv_poly_gap_stdev_pp: Option<f64>,
 }
 
 /// Shared metrics state — `Arc::clone` it into the bot task and the
@@ -243,6 +254,24 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         .ok();
         writeln!(out, "# TYPE bot_ttr_secs gauge").ok();
         writeln!(out, "bot_ttr_secs {}", t).ok();
+    }
+    if let Some(g) = snap.fv_poly_gap_mean_pp {
+        writeln!(
+            out,
+            "# HELP bot_fv_poly_gap_mean_pp Rolling-mean gap (fv_p_yes - poly_mid). Probability units, signed."
+        )
+        .ok();
+        writeln!(out, "# TYPE bot_fv_poly_gap_mean_pp gauge").ok();
+        writeln!(out, "bot_fv_poly_gap_mean_pp {}", g).ok();
+    }
+    if let Some(g) = snap.fv_poly_gap_stdev_pp {
+        writeln!(
+            out,
+            "# HELP bot_fv_poly_gap_stdev_pp Rolling-stdev of (fv_p_yes - poly_mid). Probability units."
+        )
+        .ok();
+        writeln!(out, "# TYPE bot_fv_poly_gap_stdev_pp gauge").ok();
+        writeln!(out, "bot_fv_poly_gap_stdev_pp {}", g).ok();
     }
 
     // Counters.

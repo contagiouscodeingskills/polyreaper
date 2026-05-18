@@ -449,6 +449,12 @@ struct BotState {
     /// Powers the adaptive `yes_spread_z` feature.
     yes_spread_stats: crate::stats::RollingStats,
 
+    /// Rolling distribution of `(fv_p_yes − poly_mid)` over the last
+    /// 5 minutes. Drives the model-calibration metric exposed at
+    /// `/metrics`. The DQ gate checks the *instantaneous* gap; the
+    /// rolling stats give the operator a live read on average drift.
+    fv_poly_gap_stats: crate::stats::RollingStats,
+
     /// Prometheus-style metrics registry. Updated each tick; scraped by
     /// the metrics server task. Cloning is cheap (Arc).
     metrics: crate::metrics::MetricsRegistry,
@@ -508,6 +514,10 @@ impl BotState {
             binance_flow_60s_stats: crate::stats::RollingStats::with_min_samples(60.0, 1),
             // 600s = 10 min rolling distribution of YES spreads.
             yes_spread_stats: crate::stats::RollingStats::with_min_samples(600.0, 20),
+            // 5-min window of (fv − poly) gaps. min_samples=10 → don't
+            // expose a calibration number until we have at least 10
+            // ticks of data (~1 sec at 100ms cadence).
+            fv_poly_gap_stats: crate::stats::RollingStats::with_min_samples(300.0, 10),
             metrics,
             mode: BotMode::Paper,
             live_contexts: HashMap::new(),
@@ -537,6 +547,8 @@ impl BotState {
             Some(am) => (am.strike, Some(am.ttr_secs(now_epoch_secs_f64()))),
             None => (None, None),
         };
+        let gap_mean = self.fv_poly_gap_stats.mean();
+        let gap_stdev = self.fv_poly_gap_stats.stdev();
         self.metrics.update_with(|s| {
             s.bankroll_usd = self.bankroll_usd;
             s.total_realised_pnl_usd = self.positions.total_realised();
@@ -552,6 +564,8 @@ impl BotState {
             s.latest_strike_usd = strike;
             s.latest_ttr_secs = ttr;
             s.realised_pnl_per_market_usd = realised_pnl_map;
+            s.fv_poly_gap_mean_pp = gap_mean;
+            s.fv_poly_gap_stdev_pp = gap_stdev;
             // decisions_*_total are written by record_decision elsewhere
             // and intentionally preserved across this refresh.
         });
@@ -768,6 +782,9 @@ impl BotState {
 
         // Polymarket book features.
         if let Some(snap) = am.last_poly_snapshot.as_ref() {
+            // Anchor feature: poly's YES mid. Drives the log-odds
+            // model — `p_yes = poly_mid` exactly under default weights.
+            f.poly_mid = snap.yes_mid();
             if let (Some(bs), Some(asz)) = (snap.yes_bid_size, snap.yes_ask_size) {
                 let total = bs + asz;
                 if total > 0.0 {
@@ -971,11 +988,33 @@ impl BotState {
         rec.feat_binance_volume_60s_btc = features.binance_volume_60s_btc;
         rec.feat_binance_flow_imbalance_60s = features.binance_flow_imbalance_60s;
 
+        // Calibration check: how far is our FV from poly's mid?
+        // Tracked every tick (whether we fire or not) so the rolling
+        // calibration metric reflects the model's true accuracy, not
+        // just accuracy on tradeable ticks.
+        let fv_minus_poly = match (scoring_outcome, features.poly_mid) {
+            (Some(s), Some(p)) => {
+                let gap = s.p_yes - p;
+                self.fv_poly_gap_stats.observe(now_s, gap);
+                Some(gap)
+            }
+            _ => None,
+        };
+
         // Data-quality gates — refuse to evaluate on stale or
         // implausible inputs. These run BEFORE the
         // strike/scoring/decide branches because a stale tick can't be
         // recovered by the strategy.
-        let dq_block = check_data_quality(&rec, &self.cfg.strategy);
+        let mut dq_block = check_data_quality(&rec, &self.cfg.strategy);
+        // Add the FV-divergence gate. Runs only when we have both
+        // signals (so it can't false-trigger on a missing poly book).
+        if dq_block.is_none() {
+            if let Some(gap) = fv_minus_poly {
+                if gap.abs() > self.cfg.strategy.max_fv_divergence_pp {
+                    dq_block = Some(IncompleteReason::ModelDivergence);
+                }
+            }
+        }
 
         // Decide on the outcome.
         let outcome = if let Some(reason) = dq_block {

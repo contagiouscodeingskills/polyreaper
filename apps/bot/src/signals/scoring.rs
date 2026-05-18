@@ -1,28 +1,76 @@
-//! Multi-factor hand-coded scoring model.
+//! Multi-factor hand-coded scoring model — **poly-anchored**.
 //!
-//! Given a [`Features`] snapshot (extracted by the bot from runtime
-//! state) and a per-regime weight set, produces a "true P(YES)"
-//! estimate via a weighted linear combination passed through the
-//! standard-normal CDF Φ.
+//! ## Framing
 //!
-//! Default weights deliberately recover the GBM-around-strike model as
-//! a special case: only `w_btc_strike_distance_z = 1.0`, every other
-//! weight is `0.0`. That makes the v1 scoring engine behave identically
-//! to the previous `compute_fv()` baseline, and gives a calibrated
-//! starting point for tuning each additional feature's weight by hand
-//! against observed outcomes.
+//! Polymarket's mid-price is the market's aggregate consensus. By
+//! default we trust it: the bot's `p_yes` equals `poly_mid` exactly.
+//! Every other feature is a *correction*: a small log-odds adjustment
+//! representing a specific belief that poly is mispriced.
 //!
-//! Per-regime structure: weights vary between `early` (TTR > 240s),
-//! `mid` (60–240s) and `late` (≤ 60s) — different microstructure
-//! effects dominate at each phase of a 5-minute market.
+//! ```text
+//! raw = bias
+//!     + w_poly_logit  × logit(poly_mid)        ← anchor
+//!     + w_strike_z    × z_BS                   ← Black-Scholes correction
+//!     + w_momentum    × btc_momentum           ← microstructure corrections
+//!     + w_book_imbal  × yes_book_imbalance
+//!     + …
+//! p_yes = sigmoid(raw)
+//! ```
 //!
-//! No ML training. All weights are human-readable, tunable in
-//! `configs/bot.toml`, and explicit about which feature contributes
-//! how much. See `docs/BOT_ARCHITECTURE_AND_BUILD_PLAN.md` §4.
+//! Default weights: `w_poly_logit = 1.0`, every other weight = 0.
+//! Result: `p_yes = sigmoid(logit(poly_mid)) = poly_mid`. The bot will
+//! NEVER see an edge until a feature has non-zero weight.
+//!
+//! ## Why log-odds, not Φ(z)?
+//!
+//! Earlier versions used `p_yes = Φ(weighted_z_scores)`, which is the
+//! Black-Scholes risk-neutral binary call price for the dominant term.
+//! That model has two problems:
+//!   1. At long TTR with realistic vol, `σ√T` is large and Z is small,
+//!      so `Φ(z) ≈ 0.5` regardless of microstructure. The model is
+//!      almost always uncertain, even when poly is showing 0.7.
+//!   2. It ignores poly's own signal entirely. Polymarket's mid already
+//!      aggregates information we don't have (whale flow, off-platform
+//!      sentiment). Throwing it away is wasteful.
+//!
+//! Log-odds anchoring on poly mid fixes both. The BS Z-score is still
+//! useful — as a *correction*, scaled by a small coefficient and added
+//! to poly's logit.
+//!
+//! ## Per-regime structure
+//!
+//! Weights vary between `early` (TTR > 240s), `mid` (60–240s) and
+//! `late` (≤ 60s) — different microstructure effects dominate at each
+//! phase of a 5-minute market. Each regime has its own
+//! `RegimeWeights` block.
 
 use serde::{Deserialize, Serialize};
 
 use crate::fv::norm_cdf;
+
+// ---------------------------------------------------------------------------
+// Log-odds helpers
+// ---------------------------------------------------------------------------
+
+/// `logit(p) = ln(p / (1-p))`. Maps probability to log-odds space.
+/// Clamps to `[1e-6, 1 - 1e-6]` to avoid `±∞` at the boundaries —
+/// poly prices of exactly 0 or 1 don't happen on the wire but
+/// near-boundary values do at the very end of a market.
+pub fn logit(p: f64) -> f64 {
+    let p = p.clamp(1e-6, 1.0 - 1e-6);
+    (p / (1.0 - p)).ln()
+}
+
+/// `sigmoid(x) = 1 / (1 + e^-x)`. Inverse of `logit`.
+pub fn sigmoid(x: f64) -> f64 {
+    // Numerically stable form: avoid `exp(-x)` overflow at very negative x.
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Features
@@ -38,8 +86,14 @@ use crate::fv::norm_cdf;
 /// are capped at extraction time (in the bot, not here).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Features {
-    /// `(BTC_mid − strike) / (σ × √TTR)`. Sole feature required for a
-    /// non-degenerate score; absence → `score` returns `None`.
+    /// Polymarket's own YES mid — the market's consensus. Anchor of
+    /// the log-odds model. Absent → `score` falls back to a pure-BS
+    /// path (degraded but still useful when poly book is stale).
+    pub poly_mid: Option<f64>,
+
+    /// `(BTC_mid − strike) / (σ × √TTR)`. Black-Scholes Z-score —
+    /// formerly the anchor, now a correction feature. Required when
+    /// `poly_mid` is absent.
     pub btc_strike_distance_z: Option<f64>,
 
     /// BTC log-return over 5s, normalised by σ_5s. Sign = direction,
@@ -125,14 +179,27 @@ impl Regime {
 /// Weights for one regime. The naming convention is `w_<feature>`,
 /// matching the field on [`Features`] exactly so tuning is mechanical.
 ///
-/// Default = pure GBM recovery: only `w_btc_strike_distance_z = 1.0`.
+/// **Default**: only `w_poly_logit = 1.0`. Everything else is 0. That
+/// makes `p_yes = poly_mid` exactly — the bot trusts poly's consensus
+/// completely. Online learning (or hand-tuning) then adds non-zero
+/// weights to features that empirically predict deviations.
+///
+/// All weights are coefficients in **log-odds space**. A weight of 0.5
+/// on a feature that ranges in [-1, 1] adds up to ±0.5 to the logit.
+/// At `poly_mid = 0.5` that translates to roughly ±12pp in
+/// probability space.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RegimeWeights {
-    /// Additive bias before the Φ transform. Use to skew the at-strike
-    /// probability away from 0.5 if a regime systematically biases
-    /// one side. Default 0.
+    /// Additive bias before the sigmoid. Use to skew the at-anchor
+    /// probability if a regime systematically biases one side.
+    /// Default 0.
     pub bias: f64,
+
+    /// Anchor weight: multiplies `logit(poly_mid)`. Default 1.0 —
+    /// fully trust poly's mid unless a correction feature says
+    /// otherwise. Setting this to 0 disables poly anchoring entirely.
+    pub w_poly_logit: f64,
 
     pub w_btc_strike_distance_z: f64,
     pub w_btc_drift_5s_z: f64,
@@ -151,7 +218,9 @@ impl Default for RegimeWeights {
     fn default() -> Self {
         Self {
             bias: 0.0,
-            w_btc_strike_distance_z: 1.0,
+            // Anchor on poly mid. All correction features start at 0.
+            w_poly_logit: 1.0,
+            w_btc_strike_distance_z: 0.0,
             w_btc_drift_5s_z: 0.0,
             w_btc_drift_30s_z: 0.0,
             w_btc_drift_60s_z: 0.0,
@@ -209,18 +278,33 @@ pub struct ScoringOutcome {
     pub raw: f64,
 }
 
-/// Score the features. Returns `None` if the anchor feature
-/// (`btc_strike_distance_z`) is missing — without it we have no model.
+/// Score the features in log-odds space, anchored on `poly_mid`.
 ///
-/// Other features contribute zero when missing (i.e. `weight × None`
-/// behaves as `weight × 0`). That means feature outages degrade
-/// gracefully to the simpler subset of the model, instead of failing
-/// the whole evaluation.
+/// Requires at least one of `poly_mid` or `btc_strike_distance_z` to
+/// be present — without any anchor we have no model. Returns `None`
+/// otherwise.
+///
+/// When `poly_mid` is present, it's the primary anchor (weight 1.0 by
+/// default). When absent, the model falls back to BS-only: every
+/// feature still contributes through its weight, but the anchor is
+/// the BS Z-score's contribution instead of `logit(poly_mid)`. This
+/// keeps the bot scoring when poly's book is briefly stale.
+///
+/// Missing correction features contribute zero (`weight × None` →
+/// `weight × 0`). Feature outages degrade gracefully.
 pub fn score(features: &Features, regime: Regime, cfg: &ScoringConfig) -> Option<ScoringOutcome> {
-    let z = features.btc_strike_distance_z?;
+    if features.poly_mid.is_none() && features.btc_strike_distance_z.is_none() {
+        return None;
+    }
     let w = cfg.weights_for(regime);
+    // Anchor term: poly_logit (preferred) or BS-only fallback.
+    let anchor_contribution = match features.poly_mid {
+        Some(p) => w.w_poly_logit * logit(p),
+        None => 0.0,
+    };
     let raw = w.bias
-        + w.w_btc_strike_distance_z * z
+        + anchor_contribution
+        + w.w_btc_strike_distance_z * features.btc_strike_distance_z.unwrap_or(0.0)
         + w.w_btc_drift_5s_z * features.btc_drift_5s_z.unwrap_or(0.0)
         + w.w_btc_drift_30s_z * features.btc_drift_30s_z.unwrap_or(0.0)
         + w.w_btc_drift_60s_z * features.btc_drift_60s_z.unwrap_or(0.0)
@@ -231,12 +315,21 @@ pub fn score(features: &Features, regime: Regime, cfg: &ScoringConfig) -> Option
         + w.w_binance_volume_60s_btc * features.binance_volume_60s_btc.unwrap_or(0.0)
         + w.w_binance_flow_imbalance_60s * features.binance_flow_imbalance_60s.unwrap_or(0.0)
         + w.w_btc_momentum * features.btc_momentum.unwrap_or(0.0);
-    let p_yes = norm_cdf(raw).clamp(0.0, 1.0);
+    let p_yes = sigmoid(raw).clamp(0.0, 1.0);
     Some(ScoringOutcome {
         p_yes,
         p_no: 1.0 - p_yes,
         raw,
     })
+}
+
+/// Legacy alias for the previous BS-Φ behaviour, kept only for
+/// diagnostic comparison in the decision log (so we can plot
+/// `bs_only_p_yes` vs `calibrated_p_yes` and see how often they
+/// agree). NOT used for trade decisions.
+pub fn score_bs_only(features: &Features) -> Option<f64> {
+    let z = features.btc_strike_distance_z?;
+    Some(norm_cdf(z).clamp(0.0, 1.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +351,13 @@ mod tests {
         }
     }
 
+    fn poly_only(p: f64) -> Features {
+        Features {
+            poly_mid: Some(p),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn regime_thresholds() {
         assert_eq!(Regime::from_ttr_secs(300.0), Regime::Early);
@@ -270,71 +370,73 @@ mod tests {
     }
 
     #[test]
-    fn default_weights_at_strike_returns_half() {
-        let cfg = ScoringConfig::default();
-        let out = score(&z_only(0.0), Regime::Mid, &cfg).expect("scored");
-        assert!(approx(out.p_yes, 0.5, 1e-6));
-        assert!(approx(out.p_no, 0.5, 1e-6));
-        assert!(approx(out.raw, 0.0, 1e-9));
+    fn logit_and_sigmoid_round_trip() {
+        for p in [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99] {
+            let back = sigmoid(logit(p));
+            assert!(approx(back, p, 1e-12), "round-trip failed at p={p}: got {back}");
+        }
     }
 
     #[test]
-    fn default_weights_recover_gbm_phi() {
-        // With default weights (only Z has weight 1.0), score(z) = Φ(z).
+    fn sigmoid_handles_extreme_inputs_without_overflow() {
+        assert!(approx(sigmoid(-100.0), 0.0, 1e-30));
+        assert!(approx(sigmoid(100.0), 1.0, 1e-30));
+        // No NaN at boundaries.
+        assert!(sigmoid(-1000.0).is_finite());
+        assert!(sigmoid(1000.0).is_finite());
+    }
+
+    #[test]
+    fn default_weights_recover_poly_mid_exactly() {
+        // The headline guarantee: with default weights, FV == poly_mid.
         let cfg = ScoringConfig::default();
-        for z in [-1.5, -0.5, 0.5, 1.5] {
-            let out = score(&z_only(z), Regime::Mid, &cfg).unwrap();
+        for p in [0.10, 0.30, 0.50, 0.70, 0.90] {
+            let out = score(&poly_only(p), Regime::Mid, &cfg).expect("scored");
             assert!(
-                approx(out.p_yes, norm_cdf(z), 1e-12),
-                "default scoring should equal Φ(z) at z={z}"
+                approx(out.p_yes, p, 1e-9),
+                "default scoring should equal poly_mid at p={p}; got {}",
+                out.p_yes
             );
         }
     }
 
     #[test]
-    fn missing_z_returns_none() {
+    fn missing_both_anchors_returns_none() {
         let cfg = ScoringConfig::default();
         let f = Features::default();
         assert!(score(&f, Regime::Mid, &cfg).is_none());
     }
 
     #[test]
-    fn missing_other_features_treated_as_zero() {
-        // Only Z is provided; with default weights this still scores fine.
+    fn fallback_to_bs_when_poly_missing() {
+        // Without poly_mid the model uses the BS Z-score as anchor.
+        // With default weights w_btc_strike_distance_z=0, but raw is
+        // computed from the Z-score's correction contribution (0 at
+        // default). Need w_btc_strike_distance_z > 0 to trade in this
+        // fallback regime.
         let cfg = ScoringConfig::default();
         let out = score(&z_only(1.0), Regime::Mid, &cfg).expect("scored");
-        assert!(approx(out.p_yes, norm_cdf(1.0), 1e-12));
+        // raw = 0 (anchor missing → 0) + 0×1 = 0 → sigmoid(0) = 0.5
+        assert!(approx(out.p_yes, 0.5, 1e-9));
     }
 
     #[test]
-    fn regime_weights_resolve_independently() {
+    fn momentum_weight_pushes_above_poly_anchor() {
         let mut cfg = ScoringConfig::default();
-        cfg.early.bias = -1.0;
-        cfg.late.bias = 1.0;
-        let f = z_only(0.0);
-        let early = score(&f, Regime::Early, &cfg).unwrap().p_yes;
-        let mid = score(&f, Regime::Mid, &cfg).unwrap().p_yes;
-        let late = score(&f, Regime::Late, &cfg).unwrap().p_yes;
-        // early biases negative → < 0.5; late biases positive → > 0.5;
-        // mid is default → 0.5.
-        assert!(early < 0.5 - 1e-3);
-        assert!(approx(mid, 0.5, 1e-3));
-        assert!(late > 0.5 + 1e-3);
-    }
-
-    #[test]
-    fn yes_book_imbalance_weight_lifts_p_yes() {
-        let mut cfg = ScoringConfig::default();
-        cfg.mid.w_yes_book_imbalance = 0.5;
-        // Z=0 (at strike), but heavy bid pressure on YES.
+        cfg.mid.w_btc_momentum = 0.5;
         let f = Features {
-            btc_strike_distance_z: Some(0.0),
-            yes_book_imbalance: Some(1.0),
+            poly_mid: Some(0.50),
+            btc_momentum: Some(1.0), // +1 stdev acceleration
             ..Default::default()
         };
         let out = score(&f, Regime::Mid, &cfg).expect("scored");
-        // raw = 0 + 0.5*1 = 0.5 → Φ(0.5) ≈ 0.6915
-        assert!(out.p_yes > 0.6 && out.p_yes < 0.75, "got {}", out.p_yes);
+        // raw = logit(0.5) + 0.5×1.0 = 0 + 0.5 = 0.5 → sigmoid(0.5) ≈ 0.622
+        assert!(
+            out.p_yes > 0.60 && out.p_yes < 0.64,
+            "got p_yes={}, expected ~0.622",
+            out.p_yes
+        );
+        // FV-poly gap is 0.122 — substantial but bounded.
     }
 
     #[test]
@@ -342,50 +444,86 @@ mod tests {
         let mut cfg = ScoringConfig::default();
         cfg.late.w_yes_spread_z = -1.0;
         let f = Features {
-            btc_strike_distance_z: Some(0.0),
+            poly_mid: Some(0.50),
             yes_spread_z: Some(1.0), // wider than rolling baseline
             ..Default::default()
         };
-        // raw = 0 + (-1)*1 = -1 → Φ(-1) ≈ 0.1587
         let out = score(&f, Regime::Late, &cfg).unwrap();
-        assert!(out.p_yes < 0.25, "wide spread should push p_yes down");
+        // raw = 0 + (-1)*1 = -1 → sigmoid(-1) ≈ 0.269
+        assert!(
+            out.p_yes < 0.30,
+            "wide spread should push below poly anchor; got {}",
+            out.p_yes
+        );
     }
 
     #[test]
-    fn new_phase_1_features_contribute() {
+    fn poly_anchor_dominates_when_corrections_are_small() {
+        // Three features each contribute ±0.1 in log-odds — total
+        // correction magnitude ≤ 0.3, well below the 10pp gate.
         let mut cfg = ScoringConfig::default();
-        cfg.mid.w_btc_momentum = 0.5;
-        cfg.mid.w_binance_flow_imbalance_60s = 0.5;
-        cfg.mid.w_binance_volume_60s_btc = 0.2;
+        cfg.mid.w_btc_momentum = 0.1;
+        cfg.mid.w_binance_flow_imbalance_60s = 0.1;
+        cfg.mid.w_yes_book_imbalance = 0.1;
         let f = Features {
-            btc_strike_distance_z: Some(0.0),
+            poly_mid: Some(0.40),
             btc_momentum: Some(1.0),
-            binance_flow_imbalance_60s: Some(0.5),
-            binance_volume_60s_btc: Some(2.0),
+            binance_flow_imbalance_60s: Some(1.0),
+            yes_book_imbalance: Some(1.0),
             ..Default::default()
         };
-        let out = score(&f, Regime::Mid, &cfg).expect("scored");
-        // raw = 0 + 0.5×1 + 0.5×0.5 + 0.2×2 = 0.5 + 0.25 + 0.4 = 1.15
-        assert!((out.raw - 1.15).abs() < 1e-9);
+        let out = score(&f, Regime::Mid, &cfg).unwrap();
+        // raw = logit(0.4) + 0.3 = -0.405 + 0.3 = -0.105 → sigmoid(-0.105) ≈ 0.474
+        // FV is just 0.074 above poly anchor — exactly the kind of small correction
+        // the framework is designed for.
+        let gap = (out.p_yes - 0.40).abs();
+        assert!(gap < 0.10, "small corrections should stay within 10pp of poly anchor; got gap={gap}");
     }
 
     #[test]
-    fn raw_score_exposed_for_diagnostic_logging() {
+    fn bs_only_path_returns_phi_z() {
+        // Diagnostic: BS-only prediction should still match Φ(z) for
+        // comparison logging.
+        for z in [-1.5, -0.5, 0.5, 1.5] {
+            let p = score_bs_only(&z_only(z)).unwrap();
+            assert!(approx(p, norm_cdf(z), 1e-12));
+        }
+    }
+
+    #[test]
+    fn regime_weights_resolve_independently() {
         let mut cfg = ScoringConfig::default();
-        cfg.mid.bias = 0.5;
-        let out = score(&z_only(1.0), Regime::Mid, &cfg).unwrap();
-        // raw = 0.5 + 1.0*1.0 = 1.5
-        assert!(approx(out.raw, 1.5, 1e-9));
-        assert!(approx(out.p_yes, norm_cdf(1.5), 1e-12));
+        cfg.early.bias = -1.0;
+        cfg.late.bias = 1.0;
+        let f = poly_only(0.50);
+        let early = score(&f, Regime::Early, &cfg).unwrap().p_yes;
+        let mid = score(&f, Regime::Mid, &cfg).unwrap().p_yes;
+        let late = score(&f, Regime::Late, &cfg).unwrap().p_yes;
+        // poly anchor = 0.5 (logit = 0). Bias pushes ±1.
+        // early: sigmoid(0 + -1) ≈ 0.269 ; mid: sigmoid(0) = 0.5 ; late: sigmoid(1) ≈ 0.731
+        assert!(early < 0.30);
+        assert!(approx(mid, 0.5, 1e-9));
+        assert!(late > 0.70);
     }
 
     #[test]
     fn p_yes_and_p_no_sum_to_one() {
         let cfg = ScoringConfig::default();
-        for z in [-2.0, -1.0, 0.0, 0.7, 2.5] {
-            let out = score(&z_only(z), Regime::Early, &cfg).unwrap();
+        for p in [0.05, 0.25, 0.50, 0.75, 0.95] {
+            let out = score(&poly_only(p), Regime::Early, &cfg).unwrap();
             assert!(approx(out.p_yes + out.p_no, 1.0, 1e-12));
         }
+    }
+
+    #[test]
+    fn poly_mid_near_zero_or_one_does_not_blow_up() {
+        let cfg = ScoringConfig::default();
+        // logit(0.001) ≈ -6.9; logit(0.999) ≈ 6.9. Sigmoid of those
+        // returns ~0.001 / ~0.999 — no NaN, no infinity.
+        let very_low = score(&poly_only(0.001), Regime::Late, &cfg).unwrap();
+        assert!(very_low.p_yes < 0.01);
+        let very_high = score(&poly_only(0.999), Regime::Late, &cfg).unwrap();
+        assert!(very_high.p_yes > 0.99);
     }
 
     #[test]
@@ -397,6 +535,6 @@ mod tests {
         let parsed: ScoringConfig = toml::from_str(&s).unwrap();
         assert!(approx(parsed.mid.w_yes_book_imbalance, 0.3, 1e-9));
         assert!(approx(parsed.late.bias, -0.2, 1e-9));
-        assert!(approx(parsed.early.w_btc_strike_distance_z, 1.0, 1e-9));
+        assert!(approx(parsed.early.w_poly_logit, 1.0, 1e-9));
     }
 }

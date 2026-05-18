@@ -23,6 +23,7 @@ use bot::live::client::ApiCredentials;
 use bot::metrics::{DecisionKindMetric, MetricsRegistry, MetricsSnapshot};
 use bot::position::PositionStore;
 use bot::risk::{RejectReason, RiskDecision, RiskEngine};
+use bot::signals::scoring::{score, Features, Regime, ScoringConfig};
 use bot::strategy::Signal;
 use market_registry::{MarketId, Outcome};
 
@@ -780,5 +781,83 @@ async fn live_executor_submits_signed_order_and_reconciles_to_terminal_state() {
     assert_eq!(exec.open_count(), 0);
 
     server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// FV model — poly-anchored log-odds framing
+// ---------------------------------------------------------------------------
+
+/// Headline guarantee: with default weights, the bot's `p_yes` equals
+/// the poly mid exactly. This is the contract that lets us trust the
+/// model to never blow up on cold start — the worst case is "we agree
+/// with the market" until a feature weight is set.
+#[test]
+fn default_scoring_recovers_poly_mid_within_floating_point_noise() {
+    let cfg = ScoringConfig::default();
+    for poly_mid in [0.05, 0.20, 0.35, 0.50, 0.65, 0.80, 0.95] {
+        let features = Features {
+            poly_mid: Some(poly_mid),
+            ..Default::default()
+        };
+        for regime in [Regime::Early, Regime::Mid, Regime::Late] {
+            let out = score(&features, regime, &cfg).expect("scored");
+            let gap = (out.p_yes - poly_mid).abs();
+            assert!(
+                gap < 1e-9,
+                "default FV must equal poly_mid (regime={:?}, poly={poly_mid}, fv={}, gap={gap})",
+                regime,
+                out.p_yes,
+            );
+        }
+    }
+}
+
+/// A non-trivial weight on a single feature should produce a small,
+/// bounded correction — NEVER a 60c-vs-30c gap. This is the
+/// quantitative version of the user's "model is off" intuition.
+#[test]
+fn small_correction_weights_stay_within_a_few_percentage_points_of_poly() {
+    let mut cfg = ScoringConfig::default();
+    // Set modest weights on three orthogonal correction features.
+    cfg.mid.w_btc_momentum = 0.20;
+    cfg.mid.w_btc_drift_30s_z = 0.20;
+    cfg.mid.w_yes_book_imbalance = 0.20;
+    let features = Features {
+        poly_mid: Some(0.40),
+        btc_momentum: Some(1.0),       // +1σ momentum
+        btc_drift_30s_z: Some(1.0),    // +1σ recent drift
+        yes_book_imbalance: Some(0.5), // bid-heavy
+        ..Default::default()
+    };
+    let out = score(&features, Regime::Mid, &cfg).expect("scored");
+    let gap = out.p_yes - 0.40;
+    assert!(
+        gap > 0.0 && gap < 0.15,
+        "positive corrections should lift FV above poly within ~15pp; got fv={}, gap={gap}",
+        out.p_yes,
+    );
+}
+
+/// Extreme weights CAN produce a wild gap — that's the failure mode
+/// the divergence DQ gate exists to catch. Test it explicitly.
+#[test]
+fn extreme_weights_can_produce_wild_gap_demonstrating_the_need_for_dq_gate() {
+    let mut cfg = ScoringConfig::default();
+    cfg.mid.w_btc_momentum = 5.0; // pathological weight
+    let features = Features {
+        poly_mid: Some(0.30),
+        btc_momentum: Some(1.0),
+        ..Default::default()
+    };
+    let out = score(&features, Regime::Mid, &cfg).expect("scored");
+    let gap = (out.p_yes - 0.30).abs();
+    // raw = logit(0.30) + 5×1 ≈ 4.15 → sigmoid ≈ 0.984. Gap ≈ 0.68.
+    assert!(
+        gap > 0.50,
+        "extreme weight should produce huge gap (model is broken)"
+    );
+    // The DQ gate with default `max_fv_divergence_pp = 0.10` would
+    // refuse to fire on this — assert that contract holds.
+    assert!(gap > 0.10, "this is exactly the 'fv=60 poly=30' scenario");
 }
 

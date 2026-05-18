@@ -146,6 +146,14 @@ pub struct StrategyConfig {
     /// `IncompleteReason::SigmaOutOfRange` — refuse to fire, since
     /// the vol estimator is probably picking up a venue glitch.
     pub max_sigma_per_sec: f64,
+
+    /// Refuse to fire when `|p_yes - poly_mid| > this`. Probability
+    /// units. The poly-anchored log-odds model is designed so this
+    /// gap is naturally small under sane weights — a large gap means
+    /// the learned corrections have drifted away from market truth
+    /// and we should pause until either the weights are re-calibrated
+    /// or the gap collapses. Default 0.10 (10pp).
+    pub max_fv_divergence_pp: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +255,7 @@ impl Default for StrategyConfig {
             max_poly_book_age_secs: 3.0,
             min_sigma_per_sec: 1.0e-7,
             max_sigma_per_sec: 1.0e-2,
+            max_fv_divergence_pp: 0.10,
         }
     }
 }
