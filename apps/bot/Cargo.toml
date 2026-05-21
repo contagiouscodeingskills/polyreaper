@@ -14,10 +14,6 @@ path = "src/main.rs"
 name = "demo"
 path = "src/bin/demo.rs"
 
-[[bin]]
-name = "sim_5min"
-path = "src/bin/sim_5min.rs"
-
 [lib]
 name = "bot"
 path = "src/lib.rs"

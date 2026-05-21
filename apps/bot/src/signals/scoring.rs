@@ -254,47 +254,39 @@ pub struct RegimeWeights {
 
 impl Default for RegimeWeights {
     fn default() -> Self {
-        // Starting weights. Tuned from the offline 5-min simulation
-        // in `src/bin/sim_5min.rs` — earlier values caused the model
-        // to disagree with poly by >10pp on ~30% of ticks, well above
-        // the divergence gate's tolerance.
-        //
-        // Drift / flow z-scores can swing ±2σ on noise alone over
-        // 30s; multiplying that by 0.30+ produces large probability
-        // jumps that aren't supported by the underlying signal.
-        // These smaller weights still let those features contribute
-        // when they ARE informative (drift +3σ on a real move still
-        // adds meaningful log-odds), without amplifying noise.
-        //
-        // Tune in configs/bot.toml or via future online learning.
+        // Starting weights. These reflect prior beliefs about signal
+        // strength at 5-minute BTC up/down horizons. Tune in
+        // configs/bot.toml or via future online learning.
         Self {
             bias: 0.0,
             // BS Z-score is the dominant feature — full weight.
             w_btc_strike_distance_z: 1.0,
-            // Drift carries directional information beyond static BS,
-            // but its z-scores are noisy. Modest weight.
+            // Multi-window drift carries directional information
+            // beyond static BS. 30s is the most informative band at
+            // 5-min horizons; 5s and 60s are diagnostic only.
             w_btc_drift_5s_z: 0.0,
-            w_btc_drift_30s_z: 0.15,
+            w_btc_drift_30s_z: 0.30,
             w_btc_drift_60s_z: 0.0,
-            // Book imbalance — small positive weight; both sides
-            // included so net pressure compounds.
-            w_yes_book_imbalance: 0.10,
-            w_no_book_imbalance: -0.10,
-            // Wide spread → less reliable signal. Weight 0 by
-            // default — only useful as a confidence dampener once
-            // calibrated.
+            // Book imbalance — modest positive weight; both sides
+            // included so net pressure (bid-heavy YES OR ask-heavy
+            // NO) compounds.
+            w_yes_book_imbalance: 0.20,
+            w_no_book_imbalance: -0.20,
+            // Wide spread → less reliable signal. Negative weight on
+            // spread-z so when spread blows out we pull toward 0.5.
             w_yes_spread_z: 0.0,
-            // Lag feature not yet computed.
+            // Lag feature not yet computed; weight is 0 until it is.
             w_lag_yes: 0.0,
-            // Volume — weak directional signal on its own.
+            // Volume — weak signal on its own. 0 until the data
+            // shows otherwise; flow imbalance below carries the
+            // directional content.
             w_binance_volume_60s_btc: 0.0,
-            // Flow imbalance is informative but already saturates
-            // near ±1; smaller weight than drift since the magnitude
-            // doesn't add additional info.
-            w_binance_flow_imbalance_60s: 0.20,
-            // Momentum / acceleration. Smallest weight of the
-            // microstructure signals — noisiest.
-            w_btc_momentum: 0.10,
+            // Binance trade-flow imbalance is the cleanest
+            // order-flow signal at 5-min horizons. Moderate weight.
+            w_binance_flow_imbalance_60s: 0.40,
+            // Momentum / acceleration. Smaller weight than drift
+            // (acceleration is noisier than direction).
+            w_btc_momentum: 0.15,
         }
     }
 }
@@ -465,7 +457,7 @@ mod tests {
 
     #[test]
     fn drift_30s_correction_shifts_p_yes_above_baseline() {
-        // Default drift_30s weight is 0.15; +1σ drift adds 0.15 to log-odds.
+        // Default drift_30s weight is 0.30; +1σ drift adds 0.30 to log-odds.
         let cfg = ScoringConfig::default();
         let f = Features {
             btc_strike_distance_z: Some(0.0),
@@ -473,13 +465,13 @@ mod tests {
             ..Default::default()
         };
         let out = score(&f, Regime::Mid, &cfg).expect("scored");
-        // raw = 0 + 0.15×1 = 0.15 → sigmoid(0.15) ≈ 0.537
-        assert!(out.p_yes > 0.53 && out.p_yes < 0.55, "got {}", out.p_yes);
+        // raw = 0 + 0.30×1 = 0.30 → sigmoid(0.30) ≈ 0.574
+        assert!(out.p_yes > 0.56 && out.p_yes < 0.59, "got {}", out.p_yes);
     }
 
     #[test]
     fn flow_imbalance_pushes_p_yes_directionally() {
-        let cfg = ScoringConfig::default(); // w_binance_flow_imbalance_60s = 0.20
+        let cfg = ScoringConfig::default(); // w_binance_flow_imbalance_60s = 0.40
         // Heavy aggressive buying on Binance with Z=0 (at strike).
         let f = Features {
             btc_strike_distance_z: Some(0.0),
@@ -487,8 +479,8 @@ mod tests {
             ..Default::default()
         };
         let out = score(&f, Regime::Mid, &cfg).expect("scored");
-        // raw = 0 + 0.20×1 = 0.20 → sigmoid(0.20) ≈ 0.550
-        assert!(out.p_yes > 0.54 && out.p_yes < 0.56, "got {}", out.p_yes);
+        // raw = 0 + 0.40×1 = 0.40 → sigmoid(0.40) ≈ 0.599
+        assert!(out.p_yes > 0.58 && out.p_yes < 0.62, "got {}", out.p_yes);
         // Reverse: heavy selling pushes p_yes down.
         let f = Features {
             btc_strike_distance_z: Some(0.0),
@@ -496,12 +488,12 @@ mod tests {
             ..Default::default()
         };
         let out = score(&f, Regime::Mid, &cfg).expect("scored");
-        assert!(out.p_yes < 0.46, "got {}", out.p_yes);
+        assert!(out.p_yes < 0.42, "got {}", out.p_yes);
     }
 
     #[test]
     fn book_imbalance_yes_lifts_no_imbalance_drops() {
-        // Default weights: w_yes_book_imbalance=+0.10, w_no_book_imbalance=-0.10.
+        // Default weights: w_yes_book_imbalance=+0.20, w_no_book_imbalance=-0.20.
         // YES bid-heavy AND NO ask-heavy means both signals say "YES winning".
         let cfg = ScoringConfig::default();
         let f = Features {
@@ -511,9 +503,8 @@ mod tests {
             ..Default::default()
         };
         let out = score(&f, Regime::Mid, &cfg).expect("scored");
-        // raw = 0 + 0.10×0.5 + (-0.10)×(-0.5) = 0.05 + 0.05 = 0.10
-        // sigmoid(0.10) ≈ 0.525
-        assert!(out.p_yes > 0.51 && out.p_yes < 0.54, "got {}", out.p_yes);
+        // raw = 0 + 0.20×0.5 + (-0.20)×(-0.5) = 0.1 + 0.1 = 0.2 → sigmoid ≈ 0.550
+        assert!(out.p_yes > 0.53 && out.p_yes < 0.57, "got {}", out.p_yes);
     }
 
     #[test]
@@ -527,11 +518,11 @@ mod tests {
             ..Default::default()
         };
         let out = score(&f, Regime::Mid, &cfg).expect("scored");
-        // raw = 1.0×0.5 + 0.15×1.0 + 0.20×0.5 + 0.10×0.5
-        //     = 0.5 + 0.15 + 0.10 + 0.05 = 0.80
-        assert!(approx(out.raw, 0.80, 1e-9));
-        // sigmoid(0.80) ≈ 0.690
-        assert!(out.p_yes > 0.67 && out.p_yes < 0.71, "got {}", out.p_yes);
+        // raw = 1.0×0.5 + 0.30×1.0 + 0.40×0.5 + 0.15×0.5
+        //     = 0.5 + 0.30 + 0.20 + 0.075 = 1.075
+        assert!(approx(out.raw, 1.075, 1e-9));
+        // sigmoid(1.075) ≈ 0.745
+        assert!(out.p_yes > 0.73 && out.p_yes < 0.76, "got {}", out.p_yes);
     }
 
     #[test]
