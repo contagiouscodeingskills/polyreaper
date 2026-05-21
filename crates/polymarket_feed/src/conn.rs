@@ -1,14 +1,15 @@
 //! Connection lifecycle for the Polymarket CLOB market channel.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use market_registry::Registry;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::{frame, FeedStats};
+use crate::{frame, snapshot, FeedStats};
 
 /// How long to wait between connect attempts when the registry is empty
 /// (no markets discovered yet, so nothing to subscribe to). Keeps us from
@@ -108,20 +109,91 @@ async fn connect_once(
         .map_err(|e| format!("send subscribe: {e}"))?;
 
     stats.subscriptions.incr_by(token_ids.len() as u64);
+    let mut subscribed: HashSet<String> = token_ids.iter().cloned().collect();
     tracing::info!(
         component = "polymarket_feed",
         venue = "polymarket",
         event = "subscribed",
-        token_count = token_ids.len(),
+        token_count = subscribed.len(),
         "subscribed"
     );
 
-    // Read loop. Same shape as binance_feed.
+    // Fetch REST `/book` snapshot for every subscribed token before any
+    // diffs arrive on the WS. Mirrors the Binance @depth_snapshot
+    // pattern — gives the replayer an absolute baseline if a WS diff
+    // arrives before the first `book` event. Best-effort: failure is
+    // logged, not fatal.
+    if let Err(e) = snapshot::fetch_and_persist(&cfg.clob_url, &token_ids, store).await {
+        tracing::warn!(
+            component = "polymarket_feed",
+            venue = "polymarket",
+            event = "snapshot_fetch_error",
+            error = %e,
+            "REST book snapshot fetch errored; continuing on diffs only"
+        );
+    }
+
+    // Read loop, with an interleaved subscription refresh tick.
     let idle = Duration::from_secs(cfg.read_idle_secs);
     let mut got_any = false;
+    let refresh_secs = cfg.subscription_refresh_secs.max(1);
+    let mut refresh_ticker = interval(Duration::from_secs(refresh_secs));
+    refresh_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Skip the immediate first tick — we just subscribed.
+    refresh_ticker.tick().await;
 
     loop {
-        let next = timeout(idle, ws.next()).await;
+        let next = tokio::select! {
+            biased;
+            _ = refresh_ticker.tick() => {
+                // Pick up any newly-discovered markets without forcing
+                // a full reconnect. Send one incremental MARKET
+                // subscribe message for just the new tokens.
+                let current = current_token_ids(registry);
+                let new_tokens: Vec<String> = current
+                    .into_iter()
+                    .filter(|t| !subscribed.contains(t))
+                    .collect();
+                if !new_tokens.is_empty() {
+                    let added_count = new_tokens.len();
+                    let add_msg = serde_json::json!({
+                        "type": "MARKET",
+                        "assets_ids": &new_tokens,
+                    })
+                    .to_string();
+                    if let Err(e) = ws.send(Message::Text(add_msg.into())).await {
+                        return Err(format!("send incremental subscribe: {e}"));
+                    }
+                    // Best-effort REST snapshot for the newly-subscribed
+                    // tokens too — same rationale as the initial fetch.
+                    if let Err(e) =
+                        snapshot::fetch_and_persist(&cfg.clob_url, &new_tokens, store).await
+                    {
+                        tracing::warn!(
+                            component = "polymarket_feed",
+                            venue = "polymarket",
+                            event = "incremental_snapshot_fetch_error",
+                            error = %e,
+                            "REST snapshot fetch for new tokens errored"
+                        );
+                    }
+                    for t in &new_tokens {
+                        subscribed.insert(t.clone());
+                    }
+                    stats.subscriptions.incr_by(added_count as u64);
+                    tracing::info!(
+                        component = "polymarket_feed",
+                        venue = "polymarket",
+                        event = "subscription_updated",
+                        added = added_count,
+                        total = subscribed.len(),
+                        "incremental subscribe sent for newly-discovered markets"
+                    );
+                }
+                continue;
+            }
+            r = timeout(idle, ws.next()) => r,
+        };
         match next {
             Ok(Some(Ok(Message::Text(text)))) => {
                 stats.messages.incr();

@@ -32,10 +32,19 @@ multiplier = 2.0
 # TODO confirm endpoint against live behaviour. Best guess: the CLOB
 # "market" channel for book / BBO style updates.
 ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# CLOB REST base — used for the per-token `/book` snapshot fetched on
+# each WS connect AND on every incremental subscription refresh. Gives
+# replay an absolute baseline before the first WS book event arrives.
+clob_url = "https://clob.polymarket.com"
 # 22h soak observed ~46 reconnects/hour at 30s — Polymarket goes quiet
 # during low-trade lulls. 120s lets ping/pong keep us alive while still
 # detecting dead connections within 2 min.
 read_idle_secs = 120
+# How often (seconds) to refresh the WS subscription against the
+# market registry. New 5-min BTC markets are discovered by gamma every
+# 15s; without this refresh they'd only be picked up on the next full
+# reconnect (5-15 min), missing the first portion of each market.
+subscription_refresh_secs = 10
 
 [polymarket_feed.reconnect]
 initial_ms = 500

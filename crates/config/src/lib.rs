@@ -92,8 +92,31 @@ pub struct PolymarketFeedConfig {
     // at wss://ws-subscriptions-clob.polymarket.com/ws/market. Confirm
     // against live behaviour before relying on this.
     pub ws_url: String,
+    /// CLOB REST base, e.g. `https://clob.polymarket.com`. Used for the
+    /// per-token `/book` snapshot fetched on each WS connect, mirroring
+    /// the Binance `/depth` snapshot pattern. Without this the WS diff
+    /// stream has no baseline if the first `book` event is missed
+    /// during a brief disconnect.
+    #[serde(default = "default_clob_url")]
+    pub clob_url: String,
     pub read_idle_secs: u64,
+    /// How often (seconds) the live WS subscription is refreshed
+    /// against the registry. New markets discovered by the gamma loop
+    /// after the WS connect are picked up here without forcing a full
+    /// reconnect. Default 10s — 5-min markets roll over every ~5 min
+    /// so a 10s refresh costs at most that long of missed initial book
+    /// data on a freshly-discovered market.
+    #[serde(default = "default_subscription_refresh_secs")]
+    pub subscription_refresh_secs: u64,
     pub reconnect: ReconnectBackoff,
+}
+
+fn default_clob_url() -> String {
+    "https://clob.polymarket.com".to_string()
+}
+
+fn default_subscription_refresh_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]

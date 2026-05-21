@@ -1596,6 +1596,7 @@ dependencies = [
  "config",
  "futures-util",
  "market_registry",
+ "reqwest",
  "serde_json",
  "storage",
  "telemetry",
